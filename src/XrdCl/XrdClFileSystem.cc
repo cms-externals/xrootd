@@ -344,8 +344,11 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   FileSystem::~FileSystem()
   {
-    if( !pPlugIn )
-      DefaultEnv::GetForkHandler()->UnRegisterFileSystemObject( this );
+    if( !pPlugIn ) {
+      ForkHandler* handler = DefaultEnv::GetForkHandler();
+      if( handler ) 
+	handler->UnRegisterFileSystemObject( this );
+    }
     delete pUrl;
     delete pPlugIn;
   }
