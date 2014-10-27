@@ -14,19 +14,27 @@ const char *XrdClientDebugCVSID = "$Id$";
 #include "XrdClient/XrdClientDebug.hh"
 
 #include "XrdSys/XrdSysPthread.hh"
-XrdClientDebug *XrdClientDebug::fgInstance = 0;
+std::atomic<XrdClientDebug*> XrdClientDebug::fgInstance{nullptr};
 
 //_____________________________________________________________________________
 XrdClientDebug* XrdClientDebug::Instance() {
    // Create unique instance
+   XrdClientDebug* value = fgInstance.load();
 
-   if (!fgInstance) {
-      fgInstance = new XrdClientDebug;
-      if (!fgInstance) {
-         abort();
+   if (!value) {
+      value = new XrdClientDebug;
+      XrdClientDebug* expected=nullptr;
+      if(!fgInstance.compare_exchange_strong(expected,value)) {
+        //another thread beat us to the change
+        delete value;
+
+        value = expected;
+        if (!value) {
+          abort();
+        }
       }
    }
-   return fgInstance;
+   return value;
 }
 
 //_____________________________________________________________________________
@@ -48,6 +56,7 @@ XrdClientDebug::~XrdClientDebug() {
    fOucErr = 0;
    fOucLog = 0;
 
-   delete fgInstance;
-   fgInstance = 0;
+   if(this == fgInstance) {
+     fgInstance = 0;
+   }
 }
