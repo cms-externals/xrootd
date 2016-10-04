@@ -35,7 +35,7 @@ The second mode supports on-demand downloading of individual blocks of a file
 (block-size can also be passes as opaque information in file-open
 request). The distinguishing feature of the second implementation is that it
 only downloads the requested fixed-size blocks of a file. The main motivation
-was to provide prefetching of HDFS blocks (typical size 64 or 128 MB) when
+was to provide prefetching of HDFS blocks (typical size 64k or 128M) when
 they become unavailable on local site, either permanently or temporarily due
 to server overload or other transient failures. When additional file replicas
 exist in a data-federation, the remote data can be used to supplement local
@@ -104,7 +104,7 @@ Partial file block-based prefetching is enabled with option '-prefetchFileBlock'
   with its own info file. Block size and offset are postfixed onto the file name, e.g.,
     /tmp/store/data/test.root___134217728_0
 
-- Default size of file-block is 128 MB. The size is configurable and saved into
+- Default size of file-block is 128M. The size is configurable and saved into
   corresponding info file.
 
 
@@ -112,36 +112,35 @@ Partial file block-based prefetching is enabled with option '-prefetchFileBlock'
 
 CONFIGURATION
 
--bufferSize: prefetch buffer size, default 1 MB
+pfc.blocksize: prefetch buffer size, default 1M
 
--NRamBuffersRead: number of in memmory cached blocks reserved for read tasks
+pfc.nread: number of in memory cached blocks reserved for read tasks
 
--NRamBuffersRead: number of in memmory cached blocks reserved for prefetch tasks
+pfc.nprefetch: number of in memory cached blocks reserved for prefetch tasks
 
--hwm <fraction> / -lwm <fraction>: high / low watermarks for disk cache purge
- operation (default 0.7 and 0.9)
+pfc.diskusage <lwm fraction> <hwm fraction>: high / low watermarks for disk cache
+purge operation (default 0.9 and 0.95)
 
--cacheDir <directory>: directory path to cache location
+pfc.user <username>: username used by XrdOss plugin
 
--user <username>: username required by the XrdOss plugin
+pfc.filefragmentmode [fragmentsize <bytes>] -- enable prefetching a unit of a file, 
+with default block size
+
+pfc.osslib <lpath> [<params>] path to alternative plign for output file system 
+
+pfc.decisionlib <lpath> [<prams>] path to decision library and plugin parameters
+
+Examples 
+
+a) Enable proxy file prefetching:
+pps.cachelib libXrdFileCache.so
+pfc.localroot  /data/xrd-file-cache
+pfc.nprefetch 1
 
 
-Options for block-based cache:
-
--prefetchFileBlocks -- enable prefetching a unit of a file
-
--blockSize <size in MBytes>: default size of a file-block on the local disk
-
-
-Examples:
-
-pss.cachelib /home/alja/xrd/hdfs/xfc/src/libXrdFileCache.so
-  -user alja -NRamBuffersRead 4  -NRamBuffersPrefetch 1 -cacheDir /data/xrd-file-cache
-
-
-pss.cachelib /home/alja/xrd/hdfs/xfc/src/libXrdFileCache.so
-  -user alja -cacheDir /data/hdfs-file-cache
-  -prefetchFileBlocks -blockSize 67108864
+b) enable file block mode, with block size 64 MB:
+pss.cachelib libXrdFileCache.so
+pfc.hdfsmode hdfsbsize 64m
 
 
 //==============================================================================

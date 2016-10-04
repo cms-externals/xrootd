@@ -56,7 +56,9 @@
 #include "XrdOss/XrdOssTrace.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucName2Name.hh"
+#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdOuc/XrdOucXAttr.hh"
+#include "XrdSfs/XrdSfsFlags.hh"
 #include "XrdSys/XrdSysAtomics.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysFD.hh"
@@ -100,7 +102,7 @@ XrdOss *XrdOssGetSS(XrdSysLogger *Logger, const char *config_fn,
 {
    static XrdOssSys   myOssSys;
    extern XrdSysError OssEroute;
-   XrdSysPlugin    *myLib;
+   XrdOucPinLoader *myLib;
    XrdOss          *ossP;
    XrdOss          *(*ep)(XrdOss *, XrdSysLogger *, const char *, const char *);
 
@@ -111,27 +113,34 @@ XrdOss *XrdOssGetSS(XrdSysLogger *Logger, const char *config_fn,
 
 // If no library has been specified, return the default object
 //
-   if (!OssLib) {if (myOssSys.Init(Logger, config_fn)) return 0;
+   if (!OssLib) {if (myOssSys.Init(Logger, config_fn, envP)) return 0;
                     else return (XrdOss *)&myOssSys;
                 }
 
-// Create a plugin object
+// Create a plugin object. Take into account the proxy library. Eventually,
+// we will need to support other core libraries. But, for now, this will do.
 //
    OssEroute.logger(Logger);
-   if (!(myLib = new XrdSysPlugin(&OssEroute, OssLib, "osslib",
-                                  myOssSys.myVersion))) return 0;
+   if (!(myLib = new XrdOucPinLoader(&OssEroute, myOssSys.myVersion,
+                                     "osslib",   OssLib))) return 0;
 
 // Now get the entry point of the object creator
 //
    ep = (XrdOss *(*)(XrdOss *, XrdSysLogger *, const char *, const char *))
-                    (myLib->getPlugin("XrdOssGetStorageSystem"));
+                    (myLib->Resolve("XrdOssGetStorageSystem"));
    if (!ep) return 0;
 
 // Get the Object now
 //
-   myLib->Persist(); delete myLib;
    if ((ossP = ep((XrdOss *)&myOssSys, Logger, config_fn, OssParms)) && envP)
-      ossP->EnvInfo(envP);
+      {ossP->EnvInfo(envP);
+       if (envP && strcmp(OssLib, myLib->Path()))
+          envP->Put("oss.lib", myLib->Path());
+      }
+
+// All done
+//
+   delete myLib;
    return ossP;
 }
  
@@ -160,7 +169,7 @@ XrdOss *XrdOssGetSS(XrdSysLogger *Logger, const char *config_fn,
 
   Output:   Returns zero upon success otherwise (-errno).
 */
-int XrdOssSys::Init(XrdSysLogger *lp, const char *configfn)
+int XrdOssSys::Init(XrdSysLogger *lp, const char *configfn, XrdOucEnv *envP)
 {
      int retc;
 
@@ -171,7 +180,7 @@ int XrdOssSys::Init(XrdSysLogger *lp, const char *configfn)
 // Initialize the subsystems
 //
    XrdOssSS = this;
-   if ( (retc = Configure(configfn, OssEroute)) ) return retc;
+   if ( (retc = Configure(configfn, OssEroute, envP)) ) return retc;
 
 // All done.
 //
@@ -723,7 +732,8 @@ int XrdOssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
           {close(fd); fd = (buf.st_mode & S_IFDIR ? -EISDIR : -ENOTBLK);}
        if (Oflag & (O_WRONLY | O_RDWR))
           {FSize = buf.st_size; cacheP = XrdOssCache::Find(local_path);}
-          else {if (buf.st_mode & S_ISUID && fd >= 0) {close(fd); fd=-ETXTBSY;}
+          else {if (buf.st_mode & XRDSFS_POSCPEND && fd >= 0)
+                   {close(fd); fd=-ETXTBSY;}
                 FSize = -1; cacheP = 0;
                }
       } else if (fd == -EEXIST)

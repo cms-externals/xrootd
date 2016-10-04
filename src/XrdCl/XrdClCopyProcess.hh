@@ -1,5 +1,5 @@
 //------------------------------------------------------------------------------
-// Copyright (c) 2011-2012 by European Organization for Nuclear Research (CERN)
+// Copyright (c) 2011-2014 by European Organization for Nuclear Research (CERN)
 // Author: Lukasz Janyst <ljanyst@cern.ch>
 //------------------------------------------------------------------------------
 // This file is part of the XRootD software suite.
@@ -62,30 +62,38 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Notify when the previous job has finished
       //!
+      //! @param jobNum job number
       //! @param result result of the job
       //------------------------------------------------------------------------
-      virtual void EndJob( const PropertyList *result )
+      virtual void EndJob( uint16_t            jobNum,
+                           const PropertyList *result )
       {
-        (void)result;
+        (void)jobNum; (void)result;
       };
 
       //------------------------------------------------------------------------
       //! Notify about the progress of the current job
       //!
+      //! @param jobNum         job number
       //! @param bytesProcessed bytes processed by the current job
       //! @param bytesTotal     total number of bytes to be processed by the 
       //!                       current job
       //------------------------------------------------------------------------
-      virtual void JobProgress( uint64_t bytesProcessed,
+      virtual void JobProgress( uint16_t jobNum,
+                                uint64_t bytesProcessed,
                                 uint64_t bytesTotal )
       {
-        (void)bytesProcessed; (void)bytesTotal;
+        (void)jobNum; (void)bytesProcessed; (void)bytesTotal;
       };
 
       //------------------------------------------------------------------------
       //! Determine whether the job should be canceled
       //------------------------------------------------------------------------
-      virtual bool ShouldCancel() { return false; }
+      virtual bool ShouldCancel( uint16_t jobNum )
+      {
+        (void)jobNum;
+        return false;
+      }
   };
 
   //----------------------------------------------------------------------------
@@ -136,6 +144,12 @@ namespace XrdCl
       //! tpcTimeout     [uint16_t] - time limit for the actual copy to finish
       //! dynamicSource  [bool]     - support for the case where the size source
       //!                             file may change during reading process
+      //!
+      //! Configuration job - this is a job that that is supposed to configure
+      //! the copy process as a whole instead of adding a copy job:
+      //!
+      //! jobType        [string]   - "configuration" - for configuraion
+      //! parallel       [uint8_t]  - nomber of copy jobs to be run in parallel
       //!
       //! Results:
       //! sourceCheckSum [string]   - checksum at source, if requested

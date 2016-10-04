@@ -1,7 +1,9 @@
 //------------------------------------------------------------------------------
-// Copyright (c) 2011-2012 by European Organization for Nuclear Research (CERN)
+// Copyright (c) 2011-2014 by European Organization for Nuclear Research (CERN)
 // Author: Lukasz Janyst <ljanyst@cern.ch>
 //------------------------------------------------------------------------------
+// This file is part of the XRootD software suite.
+//
 // XRootD is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -14,6 +16,10 @@
 //
 // You should have received a copy of the GNU Lesser General Public License
 // along with XRootD.  If not, see <http://www.gnu.org/licenses/>.
+//
+// In applying this licence, CERN does not waive the privileges and immunities
+// granted to it by virtue of its status as an Intergovernmental Organization
+// or submit itself to any jurisdiction.
 //------------------------------------------------------------------------------
 
 #include "XrdCl/XrdClThirdPartyCopyJob.hh"
@@ -25,6 +31,7 @@
 #include "XrdCl/XrdClMessageUtils.hh"
 #include "XrdCl/XrdClMonitor.hh"
 #include "XrdCl/XrdClUglyHacks.hh"
+#include "XrdCl/XrdClRedirectorRegistry.hh"
 #include "XrdOuc/XrdOucTPC.hh"
 #include "XrdSys/XrdSysTimer.hh"
 #include <iostream>
@@ -89,6 +96,9 @@ namespace
       }
 
     private:
+      TPCStatusHandler(const TPCStatusHandler &other);
+      TPCStatusHandler &operator = (const TPCStatusHandler &other);
+
       XrdCl::Semaphore    *pSem;
       XrdCl::XRootDStatus *pStatus;
   };
@@ -100,9 +110,10 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Constructor
   //----------------------------------------------------------------------------
-  ThirdPartyCopyJob::ThirdPartyCopyJob( PropertyList *jobProperties,
+  ThirdPartyCopyJob::ThirdPartyCopyJob( uint16_t      jobId,
+                                        PropertyList *jobProperties,
                                         PropertyList *jobResults ):
-    CopyJob( jobProperties, jobResults )
+    CopyJob( jobId, jobProperties, jobResults )
   {
     Log *log = DefaultEnv::GetLog();
     log->Debug( UtilityMsg, "Creating a third party copy job, from %s to %s",
@@ -187,7 +198,16 @@ namespace XrdCl
     //--------------------------------------------------------------------------
     // Open the target file
     //--------------------------------------------------------------------------
-    File targetFile;
+    File targetFile( File::DisableVirtRedirect );
+    // set WriteRecovery property
+    std::string value;
+    DefaultEnv::GetEnv()->GetString( "WriteRecovery", value );
+    targetFile.SetProperty( "WriteRecovery", value );
+
+    // Set the close timeout to the default value of the stream timeout
+    int closeTimeout = 0;
+    (void) DefaultEnv::GetEnv()->GetInt( "StreamTimeout", closeTimeout);
+
     OpenFlags::Flags targetFlags = OpenFlags::Update;
     if( force )
       targetFlags |= OpenFlags::Delete;
@@ -241,7 +261,7 @@ namespace XrdCl
       time_t now = time(0);
       if( now-start > timeLeft )
       {
-        targetFile.Close(1);
+        XRootDStatus status = targetFile.Close( closeTimeout );
         return XRootDStatus( stError, errOperationExpired );
       }
       else
@@ -256,11 +276,15 @@ namespace XrdCl
     {
       log->Error( UtilityMsg, "Unable set up rendez-vous: %s",
                    st.ToStr().c_str() );
-      targetFile.Close();
+      XRootDStatus status = targetFile.Close( closeTimeout );
       return st;
     }
 
-    File sourceFile;
+    File sourceFile( File::DisableVirtRedirect );
+    // set ReadRecovery property
+    DefaultEnv::GetEnv()->GetString( "ReadRecovery", value );
+    sourceFile.SetProperty( "ReadRecovery", value );
+
     st = sourceFile.Open( tpcSource.GetURL(), OpenFlags::Read, Access::None,
                           timeLeft );
 
@@ -268,7 +292,7 @@ namespace XrdCl
     {
       log->Error( UtilityMsg, "Unable to open source %s: %s",
                   tpcSource.GetURL().c_str(), st.ToStr().c_str() );
-      targetFile.Close(1);
+      XRootDStatus status = targetFile.Close( closeTimeout );
       return st;
     }
 
@@ -278,15 +302,14 @@ namespace XrdCl
     TPCStatusHandler  statusHandler;
     Semaphore        *sem  = statusHandler.GetSemaphore();
     StatInfo         *info   = 0;
-    FileSystem        fs( GetTarget().GetHostId() );
 
     st = targetFile.Sync( &statusHandler );
     if( !st.IsOK() )
     {
       log->Error( UtilityMsg, "Unable start the copy: %s",
                   st.ToStr().c_str() );
-      sourceFile.Close();
-      targetFile.Close();
+      XRootDStatus statusS = sourceFile.Close( closeTimeout );
+      XRootDStatus statusT = targetFile.Close( closeTimeout );
       return st;
     }
 
@@ -300,14 +323,14 @@ namespace XrdCl
 
       if( progress )
       {
-        st = fs.Stat( GetTarget().GetPathWithParams(), info );
+        st = targetFile.Stat( true, info );
         if( st.IsOK() )
         {
-          progress->JobProgress( info->GetSize(), sourceSize );
+          progress->JobProgress( pJobId, info->GetSize(), sourceSize );
           delete info;
           info = 0;
         }
-        bool shouldCancel = progress->ShouldCancel();
+        bool shouldCancel = progress->ShouldCancel( pJobId );
         if( shouldCancel )
         {
           log->Debug( UtilityMsg, "Cancelation requested by progress handler" );
@@ -341,16 +364,27 @@ namespace XrdCl
                   GetSource().GetURL().c_str(), GetTarget().GetURL().c_str(),
                   st.ToStr().c_str() );
 
-      sourceFile.Close(1);
-      targetFile.Close(1);
+      // Ignore close response
+      XRootDStatus statusS = sourceFile.Close( closeTimeout );
+      XRootDStatus statusT = targetFile.Close( closeTimeout );
+      return st;
+    }
+
+    XRootDStatus statusS = sourceFile.Close( closeTimeout );
+    XRootDStatus statusT = targetFile.Close( closeTimeout );
+
+    if ( !statusS.IsOK() || !statusT.IsOK() )
+    {
+      st = (statusS.IsOK() ? statusT : statusS);
+      log->Error( UtilityMsg, "Third party copy from %s to %s failed during "
+                  "close of %s: %s", GetSource().GetURL().c_str(),
+                  GetTarget().GetURL().c_str(),
+                  (statusS.IsOK() ? "destination" : "source"), st.ToStr().c_str() );
       return st;
     }
 
     log->Debug( UtilityMsg, "Third party copy from %s to %s successful",
                 GetSource().GetURL().c_str(), GetTarget().GetURL().c_str() );
-
-    sourceFile.Close(1);
-    targetFile.Close(1);
 
     pResults->Set( "size", sourceSize );
 
@@ -378,9 +412,16 @@ namespace XrdCl
         }
         else
         {
-          st = Utils::GetRemoteCheckSum( sourceCheckSum, checkSumType,
-                                         GetSource().GetHostId(),
-                                         GetSource().GetPath() );
+          VirtualRedirector *redirector = 0;
+          std::string vrCheckSum;
+          if( GetSource().IsMetalink() &&
+              ( redirector = RedirectorRegistry::Instance().Get( GetSource() ) ) &&
+              !( vrCheckSum = redirector->GetCheckSum( checkSumType ) ).empty() )
+            sourceCheckSum = vrCheckSum;
+          else
+            st = Utils::GetRemoteCheckSum( sourceCheckSum, checkSumType,
+                                         tpcSource.GetHostId(),
+                                         tpcSource.GetPath() );
         }
         gettimeofday( &oEnd, 0 );
         if( !st.IsOK() )
@@ -478,6 +519,11 @@ namespace XrdCl
     // can support the third party copy
     //--------------------------------------------------------------------------
     File          sourceFile;
+    // set WriteRecovery property
+    std::string value;
+    DefaultEnv::GetEnv()->GetString( "ReadRecovery", value );
+    sourceFile.SetProperty( "ReadRecovery", value );
+
     XRootDStatus  st;
     URL           sourceURL = source;
 
@@ -498,10 +544,20 @@ namespace XrdCl
     std::string sourceUrl; sourceFile.GetProperty( "LastURL", sourceUrl );
     URL         sourceUrlU = sourceUrl;
     properties->Set( "tpcSource", sourceUrl );
-    StatInfo *statInfo;
-    sourceFile.Stat( false, statInfo );
-    properties->Set( "sourceSize", statInfo->GetSize() );
-    delete statInfo;
+
+    VirtualRedirector *redirector = 0;
+    long long size = -1;
+    if( source.IsMetalink() &&
+        ( redirector = RedirectorRegistry::Instance().Get( sourceURL ) ) &&
+        ( size = redirector->GetSize() ) >= 0 )
+      properties->Set( "sourceSize", size );
+    else
+    {
+      StatInfo *statInfo;
+      st = sourceFile.Stat( false, statInfo );
+      if (st.IsOK()) properties->Set( "sourceSize", statInfo->GetSize() );
+      delete statInfo;
+    }
 
     if( hasInitTimeout )
     {
@@ -512,7 +568,7 @@ namespace XrdCl
         timeLeft -= (now-start);
     }
 
-    sourceFile.Close( timeLeft );
+    st = sourceFile.Close( timeLeft );
 
     if( hasInitTimeout )
     {

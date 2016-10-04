@@ -47,6 +47,7 @@
 #include "XrdCms/XrdCmsCache.hh"
 #include "XrdCms/XrdCmsConfig.hh"
 #include "XrdCms/XrdCmsCluster.hh"
+#include "XrdCms/XrdCmsClustID.hh"
 #include "XrdCms/XrdCmsNode.hh"
 #include "XrdCms/XrdCmsRole.hh"
 #include "XrdCms/XrdCmsRRQ.hh"
@@ -77,21 +78,27 @@ class XrdCmsDrop : XrdJob
 {
 public:
 
-     void DoIt() {Cluster.STMutex.Lock();
-                  int rc = Cluster.Drop(nodeEnt, nodeInst, this);
-                  Cluster.STMutex.UnLock();
-                  if (!rc) delete this;
+     void DoIt() {if (nodeP)
+                     {nodeP->Delete(Cluster.STMutex);
+                      delete this;
+                     } else {
+                      if (!Cluster.Drop(nodeEnt, nodeInst, this)) delete this;
+                     }
                  }
 
-          XrdCmsDrop(int nid, int inst) : XrdJob("drop node")
-                    {nodeEnt  = nid;
-                     nodeInst = inst;
-                     Sched->Schedule((XrdJob *)this, time(0)+Config.DRPDelay);
-                    }
+          XrdCmsDrop(XrdCmsNode *nP) : XrdJob("delete node"), nodeP(nP),
+                                       nodeEnt(0), nodeInst(0)
+                    {Sched->Schedule((XrdJob *)this);}
+
+          XrdCmsDrop(int nid, int inst) : XrdJob("drop node"), nodeP(0),
+                                          nodeEnt(nid), nodeInst(inst)
+                    {Sched->Schedule((XrdJob *)this, time(0)+Config.DRPDelay);}
+
          ~XrdCmsDrop() {}
 
-int  nodeEnt;
-int  nodeInst;
+XrdCmsNode *nodeP;
+int         nodeEnt;
+int         nodeInst;
 };
   
 /******************************************************************************/
@@ -102,7 +109,6 @@ XrdCmsCluster::XrdCmsCluster()
 {
      memset((void *)NodeTab, 0, sizeof(NodeTab));
      memset((void *)AltMans, (int)' ', sizeof(AltMans));
-     cidFirst=  0;
      AltMend = AltMans;
      AltMent = -1;
      NodeCnt =  0;
@@ -129,9 +135,12 @@ XrdCmsNode *XrdCmsCluster::Add(XrdLink *lp, int port, int Status, int sport,
    EPNAME("Add")
    const char *act = "";
    XrdCmsNode *nP = 0;
-   int Slot, Free = -1, Bump1 = -1, Bump2 = -1, Bump3 = -1, aSet = 0;
-   int tmp, Special = (Status & (CMS_isMan|CMS_isPeer));
+   XrdCmsClustID *cidP = 0;
    XrdSysMutexHelper STMHelper(STMutex);
+   int tmp, Slot, Free = -1, Bump1 = -1, Bump2 = -1, Bump3 = -1, aSet = 0;
+   bool Special = (Status & (CMS_isMan|CMS_isPeer));
+   bool SpecAlt = (Special && !(Status & CMS_isSuper));
+   bool Hidden  = false;
 
 // Find available slot for this node. Here are the priorities:
 // Slot  = Reconnecting node
@@ -163,10 +172,22 @@ XrdCmsNode *XrdCmsCluster::Add(XrdLink *lp, int port, int Status, int sport,
            nP = NodeTab[Slot];
            nP->Link      = lp;
            nP->isOffline = 0;
+           nP->isBad    &= ~XrdCmsNode::isSuspend;
            nP->isConn    = 1;
            nP->Instance++;
            nP->setName(lp, theIF, port);  // Just in case it changed
-           act = "Re-added ";
+           act = "Reconnect ";
+          }
+      }
+
+// First see if this node may be an alternate
+//
+   if (!nP && SpecAlt)
+      {if ((cidP = XrdCmsClustID::Find(theNID)) && !(cidP->IsEmpty()))
+          {if (!(nP = AddAlt(cidP, lp, port, Status, sport, theNID, theIF)))
+              return 0;
+           aSet = 1; Slot = nP->NodeID;
+           if (nP != NodeTab[Slot]) {Hidden = true; act = "Alternate ";}
           }
       }
 
@@ -190,32 +211,41 @@ XrdCmsNode *XrdCmsCluster::Add(XrdLink *lp, int port, int Status, int sport,
                    sendAList(NodeTab[Slot]->Link);
 
                 DEBUG(lp->ID << " bumps " << NodeTab[Slot]->Ident <<" #" <<Slot);
-                NodeTab[Slot]->Lock();
+                NodeTab[Slot]->Lock(true);
                 Remove("redirected", NodeTab[Slot], -1);
                 act = "Shoved ";
                }
        NodeTab[Slot] = nP = new XrdCmsNode(lp, theIF, theNID, port, 0, Slot);
+       if (!cidP) cidP = XrdCmsClustID::AddID(theNID);
+       if ((cidP->AddNode(nP, SpecAlt))) nP->cidP = cidP;
+          else {delete nP; NodeTab[Slot] = 0; return 0;} // OK to do delete!
       }
 
 // Indicate whether this snode can be redirected
 //
-   nP->isPerm = (Status & (CMS_isMan | CMS_isPeer)) ? CMS_Perm : 0;
+   nP->isPerm = (Status & (CMS_isMan | CMS_isPeer)) ? 1 : 0;
 
 // Assign new server
 //
-   if (!aSet && (Status & CMS_isMan)) setAltMan(Slot, lp, sport);
+   if (!aSet && (Status & CMS_isSuper)) setAltMan(Slot, lp, sport);
    if (Slot > STHi) STHi = Slot;
    nP->isBound   = 1;
    nP->isConn    = 1;
-   nP->isNoStage = (Status & CMS_noStage);
-   nP->isSuspend = (Status & CMS_Suspend);
-   nP->isMan     = (Status & CMS_isMan);
-   nP->isPeer    = (Status & CMS_isPeer);
-   nP->isDisable = 1;
-   NodeCnt++;
-   if (Config.SUPLevel
-   && (tmp = NodeCnt*Config.SUPLevel/100) > Config.SUPCount)
-      {Config.SUPCount=tmp; CmsState.Set(tmp);}
+   nP->isNoStage = 0 != (Status & CMS_noStage);
+   nP->isBad    |=      (Status & CMS_Suspend ? XrdCmsNode::isSuspend : 0);
+   nP->isMan     = 0 != (Status & CMS_isMan);
+   nP->isPeer    = 0 != (Status & CMS_isPeer);
+   nP->isBad    |= XrdCmsNode::isDisabled;
+   nP->subsPort  = sport;
+
+// If this is an actual non-hidden node, count it
+//
+   if (!Hidden)
+      {NodeCnt++;
+       if (Config.SUPLevel
+       && (tmp = NodeCnt*Config.SUPLevel/100) > Config.SUPCount)
+          {Config.SUPCount=tmp; CmsState.Set(tmp);}
+      } else nP->isMan |= 0x02;
 
 // Compute new peer mask, as needed
 //
@@ -223,29 +253,75 @@ XrdCmsNode *XrdCmsCluster::Add(XrdLink *lp, int port, int Status, int sport,
       else         peerHost &= ~nP->NodeMask;
    peerMask = ~peerHost;
 
-// Assign a unique cluster number
-//
-   nP->myCNUM = Assign(nP->myCID);
-
 // Document login
 //
    if (QTRACE(Debug))
-      {const char *ifPub, *ifPrv;
-       DEBUG(act <<nP->Ident <<" to cluster " <<nP->myCNUM <<" slot "
-             <<Slot <<'.' <<nP->Instance <<" (n=" <<NodeCnt <<" m="
-             <<Config.SUPCount <<") ID=" <<nP->myNID);
-       if (!nP->netIF.GetDest(XrdNetIF::Public, ifPub)) ifPub = "n/a";
-       if (!nP->netIF.GetDest(XrdNetIF::Private,ifPrv)) ifPrv = "n/a";
-       DEBUG(act <<nP->Ident <<" i/f public: " <<ifPub <<" private: " <<ifPrv);
+      {DEBUG(act <<nP->Ident <<" to cluster " <<nP->myNID <<" slot "
+             <<Slot <<'.' <<nP->Instance <<" (nodecnt=" <<NodeCnt
+             <<" supn=" <<Config.SUPCount <<")");
       }
 
 // Compute new state of all nodes if we are a reporting manager.
 //
-   if (Config.asManager()) 
-      CmsState.Update(XrdCmsState::Counts,nP->isSuspend?0:1,nP->isNoStage?0:1);
+   if (Config.asManager() && !Hidden)
+      CmsState.Update(XrdCmsState::Counts,
+                      nP->isBad & XrdCmsNode::isSuspend ? 0 : 1,
+                      nP->isNoStage ? 0 : 1);
 
 // All done
 //
+   return nP;
+}
+  
+/******************************************************************************/
+/* Private:                       A d d A l t                                 */
+/******************************************************************************/
+  
+// Warning STMutex must be held by the caller!
+
+XrdCmsNode *XrdCmsCluster::AddAlt(XrdCmsClustID *cidP, XrdLink *lp,
+                                  int port, int Status, int sport,
+                                  const char *theNID, const char *theIF)
+
+{
+   EPNAME("AddAlt")
+   XrdCmsNode *pP, *nP = 0;
+   int slot = cidP->Slot();
+
+// Check if this node is already in the alternate table
+//
+   if (cidP->Exists(lp, theNID, port))
+      {Say.Emsg(epname, lp->ID, "already logged in.");
+       return 0;
+      }
+
+// Add this node if there is room
+//
+   if (cidP->Avail())
+      {nP = new XrdCmsNode(lp, theIF, theNID, port, 0, slot);
+       if (!(cidP->AddNode(nP, true))) {delete nP; nP = 0;} // OK to do delete!
+      }
+
+// Check if we were actually able to add this node
+//
+   if (!nP)
+      {Say.Emsg(epname, "Add alternate manager", lp->ID,
+                        "failed; too many subscribers.");
+       return 0;
+      }
+
+// Check if the existing lead dead and we can substiture this one
+//
+   if ((pP = NodeTab[slot]) && !(pP->isBound))
+      {setAltMan(nP->NodeID, nP->Link, sport);
+       Say.Emsg("AddAlt", nP->Ident, "replacing dropped", pP->Ident);
+       NodeTab[slot] = nP;
+       pP->DropJob = new XrdCmsDrop(pP); // Schedule deletion
+      }
+
+// Hook the node to the cluster table and return
+//
+   nP->cidP = cidP;
    return nP;
 }
 
@@ -255,8 +331,10 @@ XrdCmsNode *XrdCmsCluster::Add(XrdLink *lp, int port, int Status, int sport,
 
 void XrdCmsCluster::BlackList(XrdOucTList *blP)
 {
+   static CmsDiscRequest discRequest = {{0, kYR_disc, 0, 0}};
    XrdCmsNode *nP;
-   int i;
+   const char *etxt = "blacklisted.";
+   int i, blRD = 0;
    bool inBL;
 
 // Obtain a lock on the table
@@ -267,16 +345,23 @@ void XrdCmsCluster::BlackList(XrdOucTList *blP)
 //
    for (i = 0; i <= STHi; i++)
        {if ((nP = NodeTab[i]))
-           {inBL = (blP && XrdCmsBlackList::Present(nP->Name(), blP));
-            if ((inBL && nP->isDisable == 2) || (!inBL && nP->isDisable != 2))
-               continue;
-            nP->Lock();
+           {inBL = (blP && (blRD = XrdCmsBlackList::Present(nP->Name(), blP)));
+            if ((!inBL && !(nP->isBad & XrdCmsNode::isBlisted))
+            ||  ( inBL &&  (nP->isBad & XrdCmsNode::isBlisted))) continue;
+            nP->Lock(true);
             STMutex.UnLock();
             if (inBL)
-               {nP->isDisable = 2;
-                Say.Emsg("Manager", nP->Name(), "blacklisted.");
+               {nP->isBad |= XrdCmsNode::isBlisted | XrdCmsNode::isDoomed;
+                if (blRD < -1)
+                  {if (kYR_Version > nP->myVersion)
+                            etxt = "blacklisted; redirect unsupported.";
+                      else  etxt = "blacklisted with redirect.";
+                   nP->isBad |= XrdCmsNode::isDoomed;
+                   nP->Send((char *)&discRequest, sizeof(discRequest));
+                  }
+                Say.Emsg("Manager", nP->Name(), etxt);
                } else {
-                nP->isDisable = 0;
+                nP->isBad &= ~(XrdCmsNode::isBlisted | XrdCmsNode::isDoomed);
                 Say.Emsg("Manager", nP->Name(), "removed from blacklist.");
                }
             nP->UnLock();
@@ -307,7 +392,7 @@ SMask_t XrdCmsCluster::Broadcast(SMask_t smask, const struct iovec *iod,
 //
    for (i = 0; i <= STHi; i++)
        {if ((nP = NodeTab[i]) && nP->isNode(bmask))
-           {nP->Lock();
+           {nP->Lock(true);
             STMutex.UnLock();
             if (nP->Send(iod, iovcnt, iotot) < 0) 
                {unQueried |= nP->Mask();
@@ -385,7 +470,7 @@ int XrdCmsCluster::Broadsend(SMask_t Who, XrdCms::CmsRRHdr &Hdr,
 //
 do{for (i = Beg; i <= Fin; i++)
        {if ((nP = NodeTab[i]) && nP->isNode(Who))
-           {nP->Lock();
+           {nP->Lock(true);
             STMutex.UnLock();
             if (nP->Send(ioV, 2, ioTot) >= 0) {nP->UnLock(); return 1;}
             DEBUG(nP->Ident <<" is unreachable");
@@ -433,76 +518,47 @@ SMask_t XrdCmsCluster::getMask(const XrdNetAddr *addr)
 
 SMask_t XrdCmsCluster::getMask(const char *Cid)
 {
-   XrdCmsNode *nP;
-   SMask_t smask(0);
-   XrdOucTList *cP;
-   int i = 1, Cnum = -1;
-
-// Lock the cluster ID list
-//
-   cidMutex.Lock();
-
-// Now find the cluster
-//
-   cP = cidFirst;
-   while(cP && (i = strcmp(Cid, cP->text)) < 0) cP = cP->next;
-
-// If we didn't find the cluster, return a mask of zeroes
-//
-   if (cP) Cnum = cP->val;
-   cidMutex.UnLock();
-   if (i) return smask;
-
-// Obtain a lock on the table
-//
-   STMutex.Lock();
-
-// Run through the table looking for a node with matching cluster number
-//
-   for (i = 0; i <= STHi; i++)
-       if ((nP = NodeTab[i]) && nP->myCNUM == Cnum) smask |= nP->NodeMask;
-
-// All done
-//
-   STMutex.UnLock();
-   return smask;
+   return XrdCmsClustID::Mask(Cid);
 }
 
 /******************************************************************************/
 /*                                  L i s t                                   */
 /******************************************************************************/
-  
-XrdCmsSelected *XrdCmsCluster::List(SMask_t mask, CmsLSOpts opts,
-                                    bool &oksel, bool &noipv4, bool &nonet)
+
+XrdCmsSelected *XrdCmsCluster::List(SMask_t mask, CmsLSOpts opts, bool &oksel)
 {
-    int i, lsall = opts & LS_All, retIP = opts & LS_IPO;
-    int onlyIP4 = (opts & LS_IP4) && !(opts & LS_IP6);
-    bool retID  = (opts & LS_IDNT) != 0, retDest = retIP || retID;
-    int destLen;
-    XrdNetIF::ifType ifType = (opts & LS_PRV ? XrdNetIF::Private
-                                             : XrdNetIF::Public);
-    XrdCmsNode     *nP;
-    XrdCmsSelected *sipp = 0, *sip;
-    const char     *destID;
+    static const int iSize = XrdCmsSelected::IdentSize;
+    XrdCmsNode      *nP;
+    XrdCmsSelected  *sipp = 0, *sip;
+    XrdNetIF::ifType ifType = (XrdNetIF::ifType)(opts & LS_IFMASK);
+    XrdNetIF::ifType ifGet  = ifType;
+    int i, destLen;
+    bool retName = (opts & LS_IDNT) != 0;
+    bool retAny  = (opts & LS_ANY ) != 0;
+    bool retDest = retName || (opts & LS_IPO);
 
 // If only one wanted, the select appropriately
 //
-   oksel = noipv4 = nonet = false;
+   oksel = false;
    STMutex.Lock();
    for (i = 0; i <= STHi; i++)
-        if ((nP=NodeTab[i]) && (lsall ||  (nP->NodeMask & mask)))
+        if ((nP=NodeTab[i]) && (nP->NodeMask & mask))
            {oksel = true;
-            if (onlyIP4 && nP->netIF.DestIPv6(ifType))
-               {noipv4 = true; continue;}
             if (retDest)
-               {if (!(destLen=nP->netIF.GetDest(ifType,destID,retID)))
-                   {nonet = true; continue;}
-               } else {
-                destID = nP->myName; destLen = nP->myNlen;
+               {     if (nP->netIF.HasDest(ifType)) ifGet = ifType;
+                else if (!retAny) continue;
+                else {ifGet = (XrdNetIF::ifType)(ifType ^ XrdNetIF::PrivateIF);
+                      if (!nP->netIF.HasDest(ifGet)) continue;
+                     }
                }
-            if (destLen >= XrdCmsSelected::IdentSize) continue;
             sip = new XrdCmsSelected(sipp);
-            sip->IdentLen = destLen; strcpy(sip->Ident, destID);
+                 if (retDest) destLen = nP->netIF.GetDest(sip->Ident, iSize,
+                                                          ifGet, retName);
+            else if (nP->myNlen >= XrdCmsSelected::IdentSize) destLen = 0;
+            else {strcpy(sip->Ident, nP->myName); destLen = nP->myNlen;}
+            if (!destLen) {delete sip; continue;}
+
+            sip->IdentLen = destLen;
             sip->Mask    = nP->NodeMask;
             sip->Id      = nP->NodeID;
             sip->Port    = nP->netIF.Port();
@@ -511,14 +567,14 @@ XrdCmsSelected *XrdCmsCluster::List(SMask_t mask, CmsLSOpts opts,
             sip->Shrin   = nP->Shrin;
             sip->Share   = nP->Share;
             sip->RoleID  = nP->RoleID;
-            if (nP->isOffline) sip->Status  = XrdCmsSelected::Offline;
-               else sip->Status  = 0;
-            if (nP->isDisable) sip->Status |= XrdCmsSelected::Disable;
+            sip->Status  = (nP->isOffline ? XrdCmsSelected::Offline : 0);
+            if (nP->isBad & (XrdCmsNode::isDisabled | XrdCmsNode::isBlisted))
+               sip->Status |= XrdCmsSelected::Disable;
             if (nP->isNoStage) sip->Status |= XrdCmsSelected::NoStage;
-            if (nP->isSuspend) sip->Status |= XrdCmsSelected::Suspend;
+            if (nP->isBad & XrdCmsNode::isSuspend)
+               sip->Status |= XrdCmsSelected::Suspend;
             if (nP->isRW     ) sip->Status |= XrdCmsSelected::isRW;
             if (nP->isMan    ) sip->Status |= XrdCmsSelected::isMangr;
-            nP->UnLock();
             sipp = sip;
            }
    STMutex.UnLock();
@@ -670,7 +726,7 @@ void *XrdCmsCluster::MonRefs()
            {for (i = 0; i <= STHi; i++)
                 if ((nP = NodeTab[i])
                 &&  (resetWR || (doReset && nP->isNode(resetMask))) )
-                    {nP->Lock();
+                    {nP->Lock(true);
                      if (resetW || doReset) nP->RefW=0;
                      if (resetR || doReset) nP->RefR=0;
                      nP->Shrem = nP->Share;
@@ -693,6 +749,14 @@ void *XrdCmsCluster::MonRefs()
 /******************************************************************************/
 
 // Warning! The node object must be locked upon entry. The lock is released
+//          upon deletion of the object.
+
+void XrdCmsCluster::Remove(XrdCmsNode *theNode)
+{
+     theNode->DropJob  = new XrdCmsDrop(theNode);
+}
+
+// Warning! The node object must be locked upon entry. The lock is released
 //          prior to returning to the caller. This entry obtains the node
 //          table lock. When immed != 0 then the node is immediately dropped.
 //          When immed if < 0 then the caller already holds the STMutex and it 
@@ -704,28 +768,37 @@ void XrdCmsCluster::Remove(const char *reason, XrdCmsNode *theNode, int immed)
    struct theLocks
           {XrdSysMutex *myMutex;
            XrdCmsNode  *myNode;
-           char        *myIdent;
-           int          myImmed;
            int          myNID;
            int          myInst;
+           bool         hasLK;
+           bool         doDrop;
+           char         myIdent[510];
 
                        theLocks(XrdSysMutex *mtx, XrdCmsNode *node, int immed)
-                               : myMutex(mtx), myNode(node), myImmed(immed)
-                               {myIdent = strdup(node->Ident);
+                               : myMutex(mtx), myNode(node), hasLK(immed < 0),
+                                 doDrop(false)
+                               {strlcpy(myIdent, node->Ident, sizeof(myIdent));
                                 myNID = node->ID(myInst);
-                                if (myImmed >= 0)
+                                if (!hasLK)
                                    {myNode->UnLock();
-                                    myMutex->Lock();
-                                    myNode->Lock();
+                                    myMutex->Lock(); // Get global lock
+                                    myNode->Lock(true);
                                    }
                                }
                       ~theLocks()
-                               {if (myImmed >= 0) myMutex->UnLock();
-                                if (myNode) myNode->UnLock();
-                                free(myIdent);
+                               {if (myNode)
+                                   {if (doDrop)
+                                       {myNode->isBound  = 0;
+                                        myNode->DropTime = 0;
+                                        myNode->DropJob  = new XrdCmsDrop(myNode);
+                                        myNode->UnLock();
+                                       } else myNode->UnLock();
+                                   }
+                                if (!hasLK) myMutex->UnLock();
                                }
           } LockHandler(&STMutex, theNode, immed);
 
+   XrdCmsNode *altNode = 0;
    int Inst, NodeID = theNode->ID(Inst);
 
 // The LockHandler makes sure that the proper locks are obtained in a deadlock
@@ -739,7 +812,7 @@ void XrdCmsCluster::Remove(const char *reason, XrdCmsNode *theNode, int immed)
              << LockHandler.myNID <<'.' <<LockHandler.myInst <<" at entry.");
       }
 
-// Mark node as being offline
+// Mark node as being offline and remove any drop job from it
 //
    theNode->isOffline = 1;
 
@@ -754,23 +827,51 @@ void XrdCmsCluster::Remove(const char *reason, XrdCmsNode *theNode, int immed)
        return;
       }
 
+// If we are not the primary node, then get rid of this node post-haste
+//
+   if (!(NodeTab[NodeID] == theNode))
+      {Say.Emsg("Remove_Node", theNode->Ident, "dropped as alternate.");
+       LockHandler.doDrop = true;
+       return;
+      }
+
 
 // If the node is part of the cluster, do not count it anymore and
 // indicate new state of this nodes if we are a reporting manager
 //
    if (theNode->isBound)
-      {theNode->isBound = 0; NodeCnt--;
+      {theNode->isBound = 0;
+       NodeCnt--;
        if (Config.asManager())
-          CmsState.Update(XrdCmsState::Counts, theNode->isSuspend ? 0 : -1,
-                                               theNode->isNoStage ? 0 : -1);
+          CmsState.Update(XrdCmsState::Counts,
+                          theNode->isBad & XrdCmsNode::isSuspend ? 0 : -1,
+                          theNode->isNoStage ? 0 : -1);
+      }
+
+// If we have a working alternate, substitute it here and immediately drop
+// the former primary. This allows the cache to remain warm.
+//
+   if (theNode->isMan && theNode->cidP && !(theNode->cidP->IsSingle())
+   && (altNode = theNode->cidP->RemNode(theNode)))
+      {if (altNode->isBound) NodeCnt++;
+       NodeTab[NodeID] = altNode;
+       if (Config.asManager())
+          CmsState.Update(XrdCmsState::Counts,
+                          altNode->isBad & XrdCmsNode::isSuspend ? 0 :  1,
+                          altNode->isNoStage ? 0 :  1);
+       setAltMan(altNode->NodeID, altNode->Link, altNode->subsPort);
+       Say.Emsg("Manager",altNode->Ident,"replacing dropped",theNode->Ident);
+       LockHandler.doDrop = true;
+       return;
       }
 
 // If this is an immediate drop request, do so now. Drop() will delete
-// the node object and remove the node lock. So, tell LockHandler that.
+// the node object, so remove the node lock and tell LockHandler that.
 //
-   if (immed || !Config.DRPDelay) 
-      {Drop(NodeID, Inst);
+   if (immed || !Config.DRPDelay || theNode->isBad & XrdCmsNode::isDoomed)
+      {theNode->UnLock();
        LockHandler.myNode = 0;
+       Drop(NodeID, Inst);
        return;
       }
 
@@ -842,10 +943,21 @@ int XrdCmsCluster::Select(XrdCmsSelect &Sel)
       }
 
 // If we are running a shared file system preform an optional restricted
-// pre-selection and then do a standard selection.
+// pre-selection and then do a standard selection. Since all nodes are equal,
+// make sure the client is needlessly avoiding them as this signals an error.
 //
    if (baseFS.isDFS())
-      {pmask = amask;
+      {if (Sel.nmask && !(Sel.Opts & XrdCmsSelect::NoTryLim))
+          {pmask = (isRW ? pinfo.rwvec : pinfo.rovec) & Sel.nmask;
+           if (!(Sel.Opts & XrdCmsSelect::Online))
+              pmask |= pinfo.ssvec & Sel.nmask;
+           if (pmask && maxBits(pmask, baseFS.dfsTries()))
+              {Sel.Resp.DLen = snprintf(Sel.Resp.Data, sizeof(Sel.Resp.Data)-1,
+               "Too many attempts to gain dfs %s access to the file", Amode)+1;
+               return RetryErr;
+              }
+          }
+       pmask = amask;
        smask = (Sel.Opts & XrdCmsSelect::Online ? 0 : pinfo.ssvec & amask);
        if (baseFS.Trim())
           {Sel.Resp.DLen = 0;
@@ -853,14 +965,7 @@ int XrdCmsCluster::Select(XrdCmsSelect &Sel)
               return (fRD ? Cache.WT4File(Sel,Sel.Vec.hf) : Config.LUPDelay);
            if (retc < 0) return -1;
           } else if (noSel) return 0;
-       if ((pmask || smask) && (retc = SelNode(Sel, pmask, smask)) >= 0)
-          return retc;
-       Sel.Resp.DLen = snprintf(Sel.Resp.Data, sizeof(Sel.Resp.Data)-1,
-                       "No %sservers are available to %s%s the file.",
-                       (retc == -2 ? "reachable " : ""),
-                       Sel.Opts & XrdCmsSelect::Online ? "immediately " : "",
-                       (smask ? "stage" : Amode))+1;
-       return -1;
+       return SelNode(Sel, pmask, smask);
       }
 
 // If either a refresh is wanted or we didn't find the file, re-prime the cache
@@ -882,9 +987,13 @@ int XrdCmsCluster::Select(XrdCmsSelect &Sel)
            else if (Sel.Vec.bf) pmask = smask = 0;
            else if (Sel.Vec.hf)
                    {if (Sel.Opts & XrdCmsSelect::NewFile) return SelFail(Sel,eExists);
-                    if (!(Sel.Opts & XrdCmsSelect::isMeta) && Config.DoMWChk
-                    &&  Multiple(Sel.Vec.hf))             return SelFail(Sel,eDups);
-                    if (!(pmask = Sel.Vec.hf & amask))    return SelFail(Sel,eROfs);
+                    if (!(Sel.Opts & XrdCmsSelect::MWFiles))
+                       {if (!(Sel.Opts & XrdCmsSelect::isMeta)
+                        &&  maxBits(Sel.Vec.hf,2))      return SelFail(Sel,eDups);
+                        if ((Sel.Vec.hf & pinfo.rwvec)
+                        !=  (Sel.Vec.hf & pinfo.rovec)) return SelFail(Sel,eROfs);
+                       }
+                    if (!(pmask = Sel.Vec.hf & amask))  return SelFail(Sel,eNoSel);
                     smask = 0;
                    }
            else if (Sel.Opts & (XrdCmsSelect::Trunc | XrdCmsSelect::NewFile))
@@ -935,37 +1044,51 @@ int XrdCmsCluster::Select(XrdCmsSelect &Sel)
 //
    if (noSel) return 0;
 
-// Select a node
+// Check if we have no useable servers
 //
-   if (dowt || (retc = SelNode(Sel, pmask, smask)) < 0)
-      {Sel.Resp.DLen = snprintf(Sel.Resp.Data, sizeof(Sel.Resp.Data)-1,
-                       "No %sservers are available to %s%s the file.",
-                       (retc == -2 ? "reachable " : ""),
-                       Sel.Opts & XrdCmsSelect::Online ? "immediately " : "",
-                       (smask ? "stage" : Amode))+1;
-       return -1;
+   if (dowt) return Unuseable(Sel);
+
+// Check if should eliminate staging servers. We may need to do this if the
+// client has been eliminating too many of them as they all should be equal.
+//
+   if (Sel.nmask && pinfo.ssvec && !(Sel.Opts & XrdCmsSelect::NoTryLim)
+   &&  maxBits(Sel.nmask & pinfo.ssvec, baseFS.stgTries()))
+      {if (!pmask)
+          {Sel.Resp.DLen = snprintf(Sel.Resp.Data, sizeof(Sel.Resp.Data)-1,
+           "Too many attempts to stage %s access to the file", Amode)+1;
+           return RetryErr;
+          }
+       smask = 0;
       }
 
-// All done
+// Select a node
 //
-   return retc;
+   return SelNode(Sel, pmask, smask);
 }
 
 /******************************************************************************/
   
 int XrdCmsCluster::Select(SMask_t pmask, int &port, char *hbuff, int &hlen,
-                          int isrw, int isMulti, int isPvt)
+                          int isrw, int isMulti, int ifWant)
 {
    static const SMask_t smLow(255);
+   XrdCmsSelector selR;
    XrdCmsNode *nP = 0;
    SMask_t tmask;
-   const char *reason;
-   int delay, nump, Snum = 0;
-   XrdNetIF::ifType nType = (isPvt ? XrdNetIF::Private : XrdNetIF::Public);
+   int Snum = 0;
+   XrdNetIF::ifType nType = static_cast<XrdNetIF::ifType>(ifWant);
 
 // If there is nothing to select from, return failure
 //
    if (!pmask) return 0;
+
+// Obtain the network we need for the client
+//
+   selR.needNet = XrdNetIF::Mask(nType);
+
+// Packed selection can never occur in this code path so we turn it off
+//
+   selR.selPack = false;
 
 // If we are exporting a shared-everything system then the incomming mask
 // may have more than one server indicated. So, we need to do a full select.
@@ -973,12 +1096,10 @@ int XrdCmsCluster::Select(SMask_t pmask, int &port, char *hbuff, int &hlen,
 //
    if (isMulti || baseFS.isDFS())
       {STMutex.Lock();
-       nP = (Config.sched_RR
-          ? SelbyRef( pmask, nump, delay, &reason, isrw)
-          : SelbyLoad(pmask, nump, delay, &reason, isrw));
+       nP = (Config.sched_RR ? SelbyRef(pmask,selR) : SelbyLoad(pmask,selR));
        STMutex.UnLock();
        if (!nP) return 0;
-       hlen = nP->netIF.GetName(nType, hbuff, port) + 1;
+       hlen = nP->netIF.GetName(hbuff, port, nType) + 1;
        nP->UnLock();
        return hlen != 1;
       }
@@ -994,14 +1115,14 @@ int XrdCmsCluster::Select(SMask_t pmask, int &port, char *hbuff, int &hlen,
 //
    STMutex.Lock();
    if ((nP = NodeTab[Snum]))
-      {if (nP->isOffline || nP->isSuspend || nP->isDisable)      nP = 0;
-          else if (!Config.sched_RR
-               && (nP->myLoad > Config.MaxLoad))                 nP = 0;
+      {     if (nP->isBad) nP = 0;
+       else if (!Config.sched_RR && (nP->myLoad > Config.MaxLoad)) nP = 0;
+       else if (!(selR.needNet & nP->hasNet))                      nP = 0;
        if (nP)
           {if (isrw)
-              if (nP->isNoStage || nP->DiskFree < nP->DiskMinF)  nP = 0;
-                 else {SelWcnt++; nP->RefTotW++; nP->RefW++; nP->Lock();}
-              else    {SelRcnt++; nP->RefTotR++; nP->RefR++; nP->Lock();}
+              if (nP->isNoStage || nP->DiskFree < nP->DiskMinF)    nP = 0;
+                 else {SelWcnt++; nP->RefTotW++; nP->RefW++; nP->Lock(true);}
+              else    {SelRcnt++; nP->RefTotR++; nP->RefR++; nP->Lock(true);}
           }
       }
    STMutex.UnLock();
@@ -1009,7 +1130,7 @@ int XrdCmsCluster::Select(SMask_t pmask, int &port, char *hbuff, int &hlen,
 // At this point either we have a node or we do not
 //
    if (nP)
-      {hlen = nP->netIF.GetName(nType, hbuff, port) + 1;
+      {hlen = nP->netIF.GetName(hbuff, port, nType) + 1;
        nP->RefR++;
        nP->UnLock();
        return hlen != 1;
@@ -1035,6 +1156,10 @@ int XrdCmsCluster::SelFail(XrdCmsSelect &Sel, int rc)
                   break;
     case eNoRep:  etext = "Unable to replicate file; no new sites available.";
                   break;
+    case eNoSel:  etext = (Sel.Vec.hf & Sel.nmask
+                        ? "Unable to write file; eligible servers shunned."
+                        : "Unable to write file; r/w exports not found.");
+                  break;
     default:      etext = "Unable to access file; file does not exist.";
                   break;
    };
@@ -1049,9 +1174,10 @@ int XrdCmsCluster::SelFail(XrdCmsSelect &Sel, int rc)
   
 void XrdCmsCluster::Space(SpaceData &sData, SMask_t smask)
 {
-   int i;
    XrdCmsNode *nP;
    SMask_t bmask;
+   int i;
+   bool doAll = !baseFS.isDFS();
 
 // Obtain a lock on the table and screen out peer nodes
 //
@@ -1061,12 +1187,16 @@ void XrdCmsCluster::Space(SpaceData &sData, SMask_t smask)
 // Run through the table getting space information
 //
    for (i = 0; i <= STHi; i++)
-       if ((nP = NodeTab[i]) && nP->isNode(bmask)
-       &&  !nP->isOffline    && nP->isRW)
-          {sData.Total += nP->DiskTotal;
-           sData.sNum++;
-           if (sData.sFree < nP->DiskFree)
-              {sData.sFree = nP->DiskFree; sData.sUtil = nP->DiskUtil;}
+       if ((nP = NodeTab[i]) && nP->isNode(bmask) && !(nP->isOffline))
+          {if (doAll || !sData.Total) 
+              {sData.Total += nP->DiskTotal;
+               sData.TotFr += nP->DiskFree;
+              }
+           if (nP->isRW & XrdCmsNode::allowsSS)
+              {sData.sNum++;
+               if (sData.sFree < nP->DiskFree)
+                  {sData.sFree = nP->DiskFree; sData.sUtil = nP->DiskUtil;}
+              }
            if (nP->isRW & XrdCmsNode::allowsRW)
               {sData.wNum++;
                if (sData.wFree < nP->DiskFree)
@@ -1153,7 +1283,7 @@ int XrdCmsCluster::Statt(char *bfr, int bln)
 // Get the statistics
 //
    if (AddFrq) RRQ.Statistics(Frq);
-   mngrsp.sp = sp = List(FULLMASK, LS_All, oksel, oksel, oksel);
+   mngrsp.sp = sp = List(FULLMASK, LS_NULL, oksel);
 
 // Count number of nodes we have
 //
@@ -1214,66 +1344,31 @@ int XrdCmsCluster::Statt(char *bfr, int bln)
 /*                       P r i v a t e   M e t h o d s                        */
 /******************************************************************************/
 /******************************************************************************/
-/*                                A s s i g n                                 */
-/******************************************************************************/
-  
-int XrdCmsCluster::Assign(const char *Cid)
-{
-   static int cNum = 0;
-   XrdOucTList *cP, *cPP, *cNew;
-   int n = -1;
-
-// Lock the cluster ID list
-//
-   cidMutex.Lock();
-
-// Now find the cluster
-//
-   cP = cidFirst; cPP = 0;
-   while(cP && (n = strcmp(Cid, cP->text)) < 0) {cPP = cP; cP = cP->next;}
-
-// If an exiting cluster simply return the cluster number
-//
-   if (!n && cP) {n = cP->val; cidMutex.UnLock(); return n;}
-
-// Add this cluster
-//
-   n = ++cNum;
-   cNew = new XrdOucTList(Cid, cNum, cP);
-   if (cPP) cPP->next = cNew;
-      else  cidFirst  = cNew;
-
-// Return the cluster number
-//
-   cidMutex.UnLock();
-   return n;
-}
-
-/******************************************************************************/
 /*                             c a l c D e l a y                              */
 /******************************************************************************/
   
-XrdCmsNode *XrdCmsCluster::calcDelay(int nump, int numd, int numf, int numo,
-                                     int nums, int &delay, const char **reason)
+XrdCmsNode *XrdCmsCluster::calcDelay(XrdCmsSelector &selR)
 {
-        if (!nump) {delay = 0;
-                    *reason = "no eligible servers for";
-                   }
-   else if (numf)  {delay = Config.DiskWT;
-                    *reason = "no eligible servers have space for";
-                   }
-   else if (numo)  {delay = Config.MaxDelay;
-                    *reason = "eligible servers overloaded for";
-                   }
-   else if (nums)  {delay = Config.SUSDelay;
-                    *reason = "eligible servers suspended for";
-                   }
-   else if (numd)  {delay = Config.SUPDelay;
-                    *reason = "eligible servers offline for";
-                   }
-   else            {delay = Config.SUPDelay;
-                    *reason = "server selection error for";
-                   }
+        if (!selR.nPick) {selR.delay = 0;
+                          selR.reason = (selR.xNoNet
+                                      ? "no eligible servers reachable for"
+                                      : "no eligible servers for");
+                         }
+   else if (selR.xFull)  {selR.delay = Config.DiskWT;
+                          selR.reason = "no eligible servers have space for";
+                         }
+   else if (selR.xOvld)  {selR.delay = Config.MaxDelay;
+                          selR.reason = "eligible servers overloaded for";
+                         }
+   else if (selR.xSusp)  {selR.delay = Config.SUSDelay;
+                          selR.reason = "eligible servers suspended for";
+                         }
+   else if (selR.xOff)   {selR.delay = Config.SUPDelay;
+                          selR.reason = "eligible servers offline for";
+                         }
+   else                  {selR.delay = Config.SUPDelay;
+                          selR.reason = "server selection error for";
+                         }
    return (XrdCmsNode *)0;
 }
 
@@ -1281,10 +1376,11 @@ XrdCmsNode *XrdCmsCluster::calcDelay(int nump, int numd, int numf, int numo,
 /*                                  D r o p                                   */
 /******************************************************************************/
   
-// Warning: STMutex must be locked upon entry; the caller must release it.
-//          This method may only be called via Remove() either directly or via
-//          a defered job scheduled by that method. This method actually
-//          deletes the node object.
+// Warning: STMutex must be locked upon entry and the caller must release it
+//          if this method is called directily. Otherwise, the mutex will be
+//          obtained and released. Also, this method may only be called via
+//          Remove() either directly or via a defered job scheduled by that
+//          method. This method actually deletes the node object.
 
 int XrdCmsCluster::Drop(int sent, int sinst, XrdCmsDrop *djp)
 {
@@ -1292,10 +1388,15 @@ int XrdCmsCluster::Drop(int sent, int sinst, XrdCmsDrop *djp)
    XrdCmsNode *nP;
    char hname[512];
 
+// If we are being called outside of a scheduled job, obtain the mutex
+//
+   if (djp) STMutex.Lock();
+
 // Make sure this node is the right one
 //
    if (!(nP = NodeTab[sent]) || nP->Inst() != sinst)
       {if (nP && djp == nP->DropJob) {nP->DropJob = 0; nP->DropTime = 0;}
+       if (djp) STMutex.UnLock();
        DEBUG(sent <<'.' <<sinst <<" cancelled.");
        return 0;
       }
@@ -1304,6 +1405,7 @@ int XrdCmsCluster::Drop(int sent, int sinst, XrdCmsDrop *djp)
 //
    if (djp && time(0) < nP->DropTime)
       {Sched->Schedule((XrdJob *)djp, nP->DropTime);
+       if (djp) STMutex.UnLock();
        return 1;
       }
 
@@ -1311,7 +1413,7 @@ int XrdCmsCluster::Drop(int sent, int sinst, XrdCmsDrop *djp)
 //
    strlcpy(hname, nP->Ident, sizeof(hname));
 
-// Remove node from the node table
+// Cleanup status
 //
    NodeTab[sent] = 0;
    nP->isOffline = 1;
@@ -1344,13 +1446,16 @@ int XrdCmsCluster::Drop(int sent, int sinst, XrdCmsDrop *djp)
 //
    if (nP->NodeMask) Cache.Drop(nP->NodeMask, sent, STHi);
 
+// We can now delete the node object if we were called via a job as we are on
+// a different thread. Direct calls require that we schedule the deletion as
+// it may take a long time if there are oustanding references to this node.
+//
+   if (djp) {STMutex.UnLock(); nP->Delete(STMutex);}
+      else nP->DropJob = new XrdCmsDrop(nP);
+
 // Document the drop
 //
    Say.Emsg("Drop_Node", hname, "dropped.");
-
-// Delete the node object
-//
-   delete nP;
    return 0;
 }
 
@@ -1387,25 +1492,43 @@ int XrdCmsCluster::Multiple(SMask_t mVec)
 }
   
 /******************************************************************************/
+/*                               m a x B i t s                                */
+/******************************************************************************/
+  
+bool XrdCmsCluster::maxBits(SMask_t mVec, int mbits)
+{
+   int count = 0;
+
+// Count bits. This is the fastest way assuming few bits are set
+//
+   while(mVec)
+        {mVec &= (mVec - 1);
+         count++;
+         if (count >= mbits) return true;
+        }
+
+// Indicate we have not reached the maximum bits set
+//
+   return false;
+}
+
+/******************************************************************************/
 /*                                R e c o r d                                 */
 /******************************************************************************/
   
-void XrdCmsCluster::Record(char *path, const char *reason)
+void XrdCmsCluster::Record(char *path, const char *reason, bool force)
 {
    EPNAME("Record")
-   static int msgcnt = 256;
+   static int msgcnt = 255;
    static XrdSysMutex mcMutex;
-   int mcnt;
+   int skipmsg;
 
    DEBUG(reason <<path);
    mcMutex.Lock();
-   msgcnt++; mcnt = msgcnt;
+   msgcnt++; skipmsg = msgcnt & (force ? 0x0f : 0xff);
    mcMutex.UnLock();
 
-   if (mcnt > 255)
-      {Say.Emsg("client defered;", reason, path);
-       mcnt = 1;
-      }
+   if (!skipmsg) Say.Emsg(epname, "client defered;", reason, path);
 }
  
 /******************************************************************************/
@@ -1415,19 +1538,27 @@ void XrdCmsCluster::Record(char *path, const char *reason)
 int XrdCmsCluster::SelNode(XrdCmsSelect &Sel, SMask_t pmask, SMask_t amask)
 {
     EPNAME("SelNode")
-    const char *act=0, *reason, *reason2 = "";
-    int pspace, needspace, delay = 0, delay2 = 0, nump, isalt = 0, pass = 2;
+    const char *act=0;
+    int isalt = 0, pass = 2;
     SMask_t mask;
     XrdCmsNode *nP = 0;
-    XrdNetIF::ifType nType = (Sel.Opts & XrdCmsSelect::Private
-                           ?  XrdNetIF::Private : XrdNetIF::Public);
+    XrdCmsSelector selR;
+    XrdNetIF::ifType nType=(XrdNetIF::ifType)(Sel.Opts & XrdCmsSelect::ifWant);
+
+// Obtain the network we need for the client
+//
+   selR.needNet = XrdNetIF::Mask(nType);
+
+// Indicate whether or not stable selection is required
+//
+   selR.selPack = (Sel.Opts & XrdCmsSelect::Pack) != 0;
 
 // There is a difference bwteen needing space and needing r/w access. The former
 // is needed when we will be writing data the latter for inode modifications.
 //
-   if (Sel.Opts & XrdCmsSelect::isMeta) needspace = 0;
-      else needspace = (Sel.Opts & XrdCmsSelect::Write?XrdCmsNode::allowsRW:0);
-   pspace = needspace;
+   if (Sel.Opts & XrdCmsSelect::isMeta) selR.needSpace = 0;
+      else selR.needSpace = (Sel.Opts & XrdCmsSelect::Write
+                          ?  XrdCmsNode::allowsRW : 0);
 
 // Scan for a primary and alternate node (alternates do staging). At this
 // point we omit all peer nodes as they are our last resort.
@@ -1436,21 +1567,21 @@ int XrdCmsCluster::SelNode(XrdCmsSelect &Sel, SMask_t pmask, SMask_t amask)
    mask = pmask & peerMask;
    while(pass--)
         {if (mask)
-            {nP = (Config.sched_RR
-                   ? SelbyRef( mask, nump, delay, &reason, needspace)
-                   : SelbyLoad(mask, nump, delay, &reason, needspace));
-             if (nP || (nump && delay) || NodeCnt < Config.SUPCount) break;
+            {nP = (Config.sched_RR || (Sel.Opts & XrdCmsSelect::UseRef)
+                ?  SelbyRef(mask,selR) : SelbyLoad(mask,selR));
+             if (nP || (selR.nPick && selR.delay)
+             ||  NodeCnt < Config.SUPCount) break;
             }
          mask = amask & peerMask; isalt = XrdCmsNode::allowsSS;
-         if (!(Sel.Opts & XrdCmsSelect::isMeta)) needspace |= isalt;
+         if (!(Sel.Opts & XrdCmsSelect::isMeta)) selR.needSpace |= isalt;
         }
    STMutex.UnLock();
 
-// Update info
+// If we found an eligible node then dispatch the client to it.
 //
    if (nP)
-      {Sel.Resp.DLen = nP->netIF.GetName(nType, Sel.Resp.Data, Sel.Resp.Port);
-       if (!Sel.Resp.DLen) {nP->UnLock(); return -2;}
+      {Sel.Resp.DLen = nP->netIF.GetName(Sel.Resp.Data, Sel.Resp.Port, nType);
+       if (!Sel.Resp.DLen) {nP->UnLock(); return Unreachable(Sel, false);}
        Sel.Resp.DLen++; Sel.smask = nP->NodeMask;
        if (isalt || (Sel.Opts & XrdCmsSelect::Create) || Sel.iovN)
           {if (isalt || (Sel.Opts & XrdCmsSelect::Create))
@@ -1465,44 +1596,56 @@ int XrdCmsCluster::SelNode(XrdCmsSelect &Sel, SMask_t pmask, SMask_t amask)
        nP->UnLock();
        TRACE(Stage, Sel.Resp.Data <<act <<Sel.Path.Val);
        return 0;
-      } else if (!delay && NodeCnt < Config.SUPCount)
-                {reason = "insufficient number of nodes";
-                 delay = Config.SUPDelay;
-                }
+      }
 
-// Return delay if selection failure is recoverable
+// No node so check if we have a sufficient number to continue. Note that we
+// do not forward to a peer unless we have a suffficient number of local nodes.
 //
-   if (delay && delay < Config.PSDelay)
-      {Record(Sel.Path.Val, reason);
-       return delay;
+   if (!selR.delay && NodeCnt < Config.SUPCount)
+      {Record(Sel.Path.Val, "insufficient number of nodes", true);
+       return Config.SUPDelay;
+      }
+
+// Return delay if we should avoid selecting a peer manager
+//
+   if (selR.delay && selR.delay < Config.PSDelay)
+      {Record(Sel.Path.Val, selR.reason);
+       return selR.delay;
       }
 
 // At this point, we attempt a peer node selection (choice of last resort)
 //
    if (Sel.Opts & XrdCmsSelect::Peers)
-      {STMutex.Lock();
-       if ((mask = (pmask | amask) & peerHost))
-          nP = SelbyCost(mask, nump, delay2, &reason2, pspace);
+      {const char *reason1 = selR.reason;
+       int delay1 = selR.delay;
+       bool noNet = selR.xNoNet;
+       STMutex.Lock();
+       if ((mask = (pmask | amask) & peerHost)) nP = SelbyCost(mask, selR);
        STMutex.UnLock();
        if (nP)
-          {Sel.Resp.DLen = nP->netIF.GetName(nType,Sel.Resp.Data,Sel.Resp.Port);
-           if (!Sel.Resp.DLen) {nP->UnLock(); return -2;}
+          {Sel.Resp.DLen = nP->netIF.GetName(Sel.Resp.Data,Sel.Resp.Port,nType);
+           if (!Sel.Resp.DLen) {nP->UnLock(); return Unreachable(Sel, false);}
            Sel.Resp.DLen++; Sel.smask = nP->NodeMask;
            if (Sel.iovN && Sel.iovP) nP->Send(Sel.iovP, Sel.iovN);
            nP->UnLock();
            TRACE(Stage, "Peer " <<Sel.Resp.Data <<" handling " <<Sel.Path.Val);
            return 0;
           }
-       if (!delay) {delay = delay2; reason = reason2;}
+       if (!selR.delay)
+          {selR.delay = delay1; selR.reason = reason1; selR.xNoNet = noNet;}
       }
 
 // At this point we either don't have enough nodes or simply can't handle this
 //
-   if (delay)
-      {TRACE(Defer, "client defered; " <<reason <<" for " <<Sel.Path.Val);
-       return delay;
+   if (selR.delay)
+      {Record(Sel.Path.Val, selR.reason);
+       return selR.delay;
       }
-   return -1;
+
+// Return appropriate error message
+//
+   if (selR.xNoNet) return Unreachable(Sel, true);
+   return Unuseable(Sel);
 }
 
 /******************************************************************************/
@@ -1527,40 +1670,41 @@ int XrdCmsCluster::SelNode(XrdCmsSelect &Sel, SMask_t pmask, SMask_t amask)
 // Cost selection is used only for peer node selection as peers do not
 // report a load and handle their own scheduling.
 
-XrdCmsNode *XrdCmsCluster::SelbyCost(SMask_t mask, int &nump, int &delay,
-                                     const char **reason, int needspace)
+XrdCmsNode *XrdCmsCluster::SelbyCost(SMask_t mask, XrdCmsSelector &selR)
 {
-    int i, numd, numf, nums, Multi = 0;
     XrdCmsNode *np, *sp = 0;
+    bool Multi = false;
 
 // Scan for a node (sp points to the selected one)
 //
-   nump=nums=numf=numd = 0; SelTcnt++; // possible, suspended, full, and dead
-   for (i = 0; i <= STHi; i++)
+   selR.Reset(); SelTcnt++;
+   for (int i = 0; i <= STHi; i++)
        if ((np = NodeTab[i]) && (np->NodeMask & mask))
-          {nump++;
-           if (np->isOffline)                   {numd++; continue;}
-           if (np->isSuspend || np->isDisable)  {nums++; continue;}
-           if (needspace &&     np->isNoStage)  {numf++; continue;}
+          {if (!(selR.needNet &  np->hasNet))    {selR.xNoNet= true; continue;}
+           selR.nPick++;
+           if (np->isOffline)                    {selR.xOff  = true; continue;}
+           if (np->isBad)                        {selR.xSusp = true; continue;}
+           if (selR.needSpace && np->isNoStage)  {selR.xFull = true; continue;}
            if (!sp) sp = np;
               else{if (abs(sp->myCost - np->myCost) <= Config.P_fuzz)
-                      {if (needspace)
-                          {if (sp->RefW > (np->RefW+Config.DiskLinger))
-                               sp=np;
-                           } 
-                           else if (sp->RefR > np->RefR) sp=np;
-                       }
+                      {     if (selR.selPack)
+                               {if (sp->Inst() > np->Inst()) sp=np;}
+                       else if (selR.needSpace)
+                               {if (sp->RefW > (np->RefW+Config.DiskLinger))
+                                   sp=np;
+                               }
+                       else if (sp->RefR > np->RefR) sp=np;
+                      }
                        else if (sp->myCost > np->myCost) sp=np;
-                   Multi = 1;
+                   Multi = true;
                   }
           }
 
 // Check for overloaded node and return result
 //
-   if (!sp) return calcDelay(nump, numd, numf, 0, nums, delay, reason);
-   sp->Lock();
-   RefCount(sp, Multi, needspace);
-   delay = 0;
+   if (!sp) return calcDelay(selR);
+   sp->Lock(true);
+   RefCount(sp, Multi, selR.needSpace);
    return sp;
 }
   
@@ -1568,45 +1712,50 @@ XrdCmsNode *XrdCmsCluster::SelbyCost(SMask_t mask, int &nump, int &delay,
 /*                             S e l b y L o a d                              */
 /******************************************************************************/
   
-XrdCmsNode *XrdCmsCluster::SelbyLoad(SMask_t mask, int &nump, int &delay,
-                                     const char **reason, int needspace)
+XrdCmsNode *XrdCmsCluster::SelbyLoad(SMask_t mask, XrdCmsSelector &selR)
 {
-    int i, numd, numf, numo, nums, Multi = 0;
-    int reqSS = needspace & XrdCmsNode::allowsSS;
     XrdCmsNode *np, *sp = 0;
+    bool Multi = false, reqSS = (selR.needSpace & XrdCmsNode::allowsSS) != 0;
 
 // Scan for a node (preset possible, suspended, overloaded, full, and dead)
 //
-   nump = nums = numo = numf = numd = 0; SelTcnt++;
-   for (i = 0; i <= STHi; i++)
+   selR.Reset(); SelTcnt++;
+   for (int i = 0; i <= STHi; i++)
        if ((np = NodeTab[i]) && (np->NodeMask & mask))
-          {nump++;
-           if (np->isOffline)                     {numd++; continue;}
-           if (np->isSuspend || np->isDisable)    {nums++; continue;}
-           if (np->myLoad > Config.MaxLoad)       {numo++; continue;}
-           if (needspace && (np->DiskFree < np->DiskMinF
-                             || (reqSS && np->isNoStage)))
-              {numf++; continue;}
+          {if (!(selR.needNet & np->hasNet))      {selR.xNoNet= true; continue;}
+           selR.nPick++;
+           if (np->isOffline)                     {selR.xOff  = true; continue;}
+           if (np->isBad)                         {selR.xSusp = true; continue;}
+           if (np->myLoad > Config.MaxLoad)       {selR.xOvld = true; continue;}
+           if (selR.needSpace && (np->DiskFree < np->DiskMinF
+                                  || (reqSS && np->isNoStage)))
+              {selR.xFull = true; continue;}
            if (!sp) sp = np;
-              else{if (needspace)
+              else{if (selR.needSpace)
                       {if (abs(sp->myMass - np->myMass) <= Config.P_fuzz)
-                          {if (sp->RefW > (np->RefW+Config.DiskLinger)) sp=np;}
+                          {if (selR.selPack)
+                              {if (sp->Inst() > np->Inst())             sp=np;}
+                           else
+                           if (sp->RefW > (np->RefW+Config.DiskLinger)) sp=np;
+                          }
                           else if (sp->myMass > np->myMass)             sp=np;
                       } else {
                        if (abs(sp->myLoad - np->myLoad) <= Config.P_fuzz)
-                          {if (sp->RefR > np->RefR)                     sp=np;}
+                          {if (selR.selPack)
+                              {if (sp->Inst() > np->Inst())             sp=np;}
+                              else if (sp->RefR > np->RefR)             sp=np;
+                          }
                           else if (sp->myLoad > np->myLoad)             sp=np;
                       }
-                   Multi = 1;
+                   Multi = true;
                   }
           }
 
 // Check for overloaded node and return result
 //
-   if (!sp) return calcDelay(nump, numd, numf, numo, nums, delay, reason);
-   sp->Lock();
-   RefCount(sp, Multi, needspace);
-   delay = 0;
+   if (!sp) return calcDelay(selR);
+   sp->Lock(true);
+   RefCount(sp, Multi, selR.needSpace);
    return sp;
 }
 
@@ -1614,38 +1763,37 @@ XrdCmsNode *XrdCmsCluster::SelbyLoad(SMask_t mask, int &nump, int &delay,
 /*                              S e l b y R e f                               */
 /******************************************************************************/
 
-XrdCmsNode *XrdCmsCluster::SelbyRef(SMask_t mask, int &nump, int &delay,
-                                    const char **reason, int needspace)
+XrdCmsNode *XrdCmsCluster::SelbyRef(SMask_t mask, XrdCmsSelector &selR)
 {
-    int i, numd, numf, nums, Multi = 0;
-    int reqSS = needspace & XrdCmsNode::allowsSS;
     XrdCmsNode *np, *sp = 0;
+    bool Multi = false, reqSS = (selR.needSpace & XrdCmsNode::allowsSS) != 0;
 
 // Scan for a node (sp points to the selected one)
 //
-   nump=nums=numf=numd = 0; SelTcnt++; // possible, suspended, full, and dead
-   for (i = 0; i <= STHi; i++)
+   selR.Reset(); SelTcnt++;
+   for (int i = 0; i <= STHi; i++)
        if ((np = NodeTab[i]) && (np->NodeMask & mask))
-          {nump++;
-           if (np->isOffline)                   {numd++; continue;}
-           if (np->isSuspend || np->isDisable)  {nums++; continue;}
-           if (needspace && (np->DiskFree < np->DiskMinF
-                             || (reqSS && np->isNoStage)))
-              {numf++; continue;}
+          {if (!(selR.needNet & np->hasNet))    {selR.xNoNet= true; continue;}
+           selR.nPick++;
+           if (np->isOffline)                   {selR.xOff  = true; continue;}
+           if (np->isBad)                       {selR.xSusp = true; continue;}
+           if (selR.needSpace && (np->DiskFree < np->DiskMinF
+                                  || (reqSS && np->isNoStage)))
+              {selR.xFull = true; continue;}
            if (!sp) sp = np;
-              else {if (needspace)
-                      {if (sp->RefW > (np->RefW+Config.DiskLinger)) sp=np;}
-                       else if (sp->RefR > np->RefR) sp=np;
-                    Multi = 1;
+              else {Multi = true;
+                         if (selR.selPack) {if (sp->Inst() > np->Inst())sp=np;}
+                    else if (selR.needSpace)
+                            {if (sp->RefW > (np->RefW+Config.DiskLinger)) sp=np;}
+                    else if (sp->RefR > np->RefR)                         sp=np;
                    }
           }
 
 // Check for overloaded node and return result
 //
-   if (!sp) return calcDelay(nump, numd, numf, 0, nums, delay, reason);
-   sp->Lock();
-   RefCount(sp, Multi, needspace);
-   delay = 0;
+   if (!sp) return calcDelay(selR);
+   sp->Lock(true);
+   RefCount(sp, Multi, selR.needSpace);
    return sp;
 }
  
@@ -1667,6 +1815,9 @@ int XrdCmsCluster::SelDFS(XrdCmsSelect &Sel, SMask_t amask,
       {if (!baseFS.Local())
           {CmsStateRequest QReq = {{Sel.Path.Hash, kYR_state, kYR_raw, 0}};
            TRACE(Files, "seeking " <<Sel.Path.Val);
+           Cache.AddFile(Sel, 0);
+           if (Sel.Opts & XrdCmsSelect::Refresh)
+              QReq.Hdr.modifier |= CmsStateRequest::kYR_refresh;
            Cluster.Broadsend(amask, QReq.Hdr, Sel.Path.Val, Sel.Path.Len+1);
            return 0;
           }
@@ -1700,7 +1851,8 @@ int XrdCmsCluster::SelDFS(XrdCmsSelect &Sel, SMask_t amask,
 
 // Final verification that we have something to select
 //
-   if (!Sel.Vec.hf && (!isRW || !(Sel.Opts & XrdCmsSelect::NewFile)))
+   if (!Sel.Vec.hf
+   && (!isRW || !(Sel.Opts & (XrdCmsSelect::Trunc | XrdCmsSelect::NewFile))))
       return SelFail(Sel, eNoEnt);
    return 1;
 }
@@ -1764,14 +1916,54 @@ void XrdCmsCluster::setAltMan(int snum, XrdLink *lp, int port)
    if (!port || (port > 0x0000ffff)) port = Config.PortTCP;
    memset(ap, int(' '), AltSize);
 
+// First tr to use the hostname:port which may be too large (unlikely). Else
 // Insert the ip address of this node into the list of nodes. We made sure that
 // the size of he buffer was big enough so no need to check for overflow.
 //
    altAddr.Port(port);
-   i = altAddr.Format(ap, AltSize, XrdNetAddr::fmtAddr, XrdNetAddr::old6Map4);
+   if (Config.DoHnTry) i = altAddr.Format(ap, AltSize, XrdNetAddr::fmtName);
+      else i = 0;
+   if (!i) i=altAddr.Format(ap,AltSize,XrdNetAddr::fmtAddr,XrdNetAddr::prefipv4);
    ap[i] = ' ';
 
 // Compute new fence
 //
    if (ap >= AltMend) {AltMend = ap + AltSize; AltMent = snum;}
+}
+
+/******************************************************************************/
+/*                           U n r e a c h a b l e                            */
+/******************************************************************************/
+  
+int XrdCmsCluster::Unreachable(XrdCmsSelect &Sel, bool none)
+{
+   XrdNetIF::ifType nType=(XrdNetIF::ifType)(Sel.Opts & XrdCmsSelect::ifWant);
+   const char *Amode = (Sel.Opts & XrdCmsSelect::Write  ? "write" : "read");
+   const char *Xmode = (Sel.Opts & XrdCmsSelect::Online ? "immediately " : "");
+
+   if (none)
+      {Sel.Resp.DLen = snprintf(Sel.Resp.Data, sizeof(Sel.Resp.Data)-1,
+               "No servers are reachable via %s network to %s%s the file.",
+               XrdNetIF::Name(nType), Xmode, Amode) + 1;
+      } else {
+       Sel.Resp.DLen = snprintf(Sel.Resp.Data, sizeof(Sel.Resp.Data)-1,
+               "Eligible server is unreachable via %s network to %s%s the file.",
+               XrdNetIF::Name(nType), Xmode, Amode) + 1;
+      }
+
+   return -1;
+}
+  
+/******************************************************************************/
+/*                             U n u s e a b l e                              */
+/******************************************************************************/
+  
+int XrdCmsCluster::Unuseable(XrdCmsSelect &Sel)
+{
+   const char *Amode = (Sel.Opts & XrdCmsSelect::Write  ? "write" : "read");
+   const char *Xmode = (Sel.Opts & XrdCmsSelect::Online ? "immediately " : "");
+
+   Sel.Resp.DLen = snprintf(Sel.Resp.Data, sizeof(Sel.Resp.Data)-1,
+                   "No servers are available to %s%s the file.",Xmode,Amode)+1;
+   return -1;
 }

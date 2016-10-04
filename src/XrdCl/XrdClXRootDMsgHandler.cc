@@ -146,7 +146,8 @@ namespace XrdCl
         return Take | RemoveHandler;
 
       case kXR_waitresp:
-        return Take;
+        pResponse = 0;
+        return Take | Ignore; // This must be handled synchronously!
 
       //------------------------------------------------------------------------
       // Handle the potential raw cases
@@ -242,6 +243,15 @@ namespace XrdCl
   }
 
   //----------------------------------------------------------------------------
+  // Get handler sid
+  //----------------------------------------------------------------------------
+  uint16_t XRootDMsgHandler::GetSid() const
+  {
+    ClientRequest* req = (ClientRequest*) pRequest->GetBuffer();
+    return ((uint16_t)req->header.streamid[1] << 8) | (uint16_t)req->header.streamid[0];
+  }
+
+  //----------------------------------------------------------------------------
   //! Process the message if it was "taken" by the examine action
   //----------------------------------------------------------------------------
   void XRootDMsgHandler::Process( Message *msg )
@@ -261,11 +271,29 @@ namespace XrdCl
                  pRequest->GetDescription().c_str() );
       Message *embededMsg = new Message( rsp->hdr.dlen-8 );
       embededMsg->Append( msg->GetBuffer( 16 ), rsp->hdr.dlen-8 );
-      delete msg;
+      XRDCL_SMART_PTR_T<Message> msgPtr( msg );
       pResponse = embededMsg; // this can never happen for oksofars
 
       // we need to unmarshall the header by hand
       XRootDTransport::UnMarshallHeader( embededMsg );
+
+      //------------------------------------------------------------------------
+      // Check if the dlen field of the embedded message is consistent with
+      // the dlen value of the original message
+      //------------------------------------------------------------------------
+      ServerResponse *embRsp = (ServerResponse *)embededMsg->GetBuffer();
+      if( embRsp->hdr.dlen != rsp->hdr.dlen-16 )
+      {
+        log->Error( XRootDMsg, "[%s] Sizes of the async response to %s and the "
+                    "embedded message are inconsistent. Expected %d, got %d.",
+                    pUrl.GetHostId().c_str(), pRequest->GetDescription().c_str(),
+                    rsp->hdr.dlen-16, embRsp->hdr.dlen);
+
+        pStatus = Status( stFatal, errInvalidMessage );
+        HandleResponse();
+        return;
+      }
+
       Process( embededMsg );
       return;
     }
@@ -285,7 +313,14 @@ namespace XrdCl
     //--------------------------------------------------------------------------
     // Process the message
     //--------------------------------------------------------------------------
-    XRootDTransport::UnMarshallBody( msg, req->header.requestid );
+    Status st = XRootDTransport::UnMarshallBody( msg, req->header.requestid );
+    if( !st.IsOK() )
+    {
+      pStatus = Status( stFatal, errInvalidMessage );
+      HandleResponse();
+      return;
+    }
+
     switch( rsp->hdr.status )
     {
       //------------------------------------------------------------------------
@@ -306,12 +341,16 @@ namespace XrdCl
       //------------------------------------------------------------------------
       case kXR_error:
       {
+        char *errmsg = new char[rsp->hdr.dlen-3]; errmsg[rsp->hdr.dlen-4] = 0;
+        memcpy( errmsg, rsp->body.error.errmsg, rsp->hdr.dlen-4 );
         log->Dump( XRootDMsg, "[%s] Got a kXR_error response to request %s "
                    "[%d] %s", pUrl.GetHostId().c_str(),
                    pRequest->GetDescription().c_str(), rsp->body.error.errnum,
-                   rsp->body.error.errmsg );
+                   errmsg );
+        delete [] errmsg;
 
-        HandleError( Status(stError, errErrorResponse), pResponse );
+        HandleError( Status(stError, errErrorResponse, rsp->body.error.errnum),
+                     pResponse );
         return;
       }
 
@@ -398,27 +437,72 @@ namespace XrdCl
         o << urlComponents[0];
         if( rsp->body.redirect.port != -1 )
           o << ":" << rsp->body.redirect.port << "/";
-        pUrl = URL( o.str() );
-        if( !pUrl.IsValid() )
+
+        URL newUrl = URL( o.str() );
+        if( !newUrl.IsValid() )
         {
           pStatus = Status( stError, errInvalidRedirectURL );
           log->Error( XRootDMsg, "[%s] Got invalid redirection URL: %s",
-                                pUrl.GetHostId().c_str(), urlInfo.c_str() );
+                      pUrl.GetHostId().c_str(), urlInfo.c_str() );
           HandleResponse();
           return;
         }
-        pRedirectUrl = pUrl.GetURL();
 
-        URL cgiURL;
-        if( urlComponents.size() > 1 )
-        {
-          std::ostringstream o;
-          o << "fake://fake:111//fake?";
-          o << urlComponents[1];
-          pRedirectUrl += "?";
-          pRedirectUrl += urlComponents[1];
-          cgiURL = URL( o.str() );
-        }
+        if( pUrl.GetUserName() != "" && newUrl.GetUserName() == "" )
+          newUrl.SetUserName( pUrl.GetUserName() );
+
+        if( pUrl.GetPassword() != "" && newUrl.GetPassword() == "" )
+          newUrl.SetPassword( pUrl.GetPassword() );
+
+	//----------------------------------------------------------------------
+	// Forward any "xrd.*" params from the original client request also to
+	// the new redirection url
+	//----------------------------------------------------------------------
+	std::ostringstream ossXrd;
+	const URL::ParamsMap &urlParams = pUrl.GetParams();
+
+	for(URL::ParamsMap::const_iterator it = urlParams.begin();
+	    it != urlParams.end(); ++it )
+	{
+	  if( it->first.compare( 0, 4, "xrd." ) )
+	    continue;
+
+	  ossXrd << it->first << '=' << it->second << '&';
+	}
+
+	std::string xrdCgi = ossXrd.str();
+	pUrl         = newUrl;
+	pRedirectUrl = newUrl.GetURL();
+
+	URL cgiURL;
+	if( urlComponents.size() > 1 )
+	{
+	  pRedirectUrl += "?";
+	  pRedirectUrl += urlComponents[1];
+	  std::ostringstream o;
+	  o << "fake://fake:111//fake?";
+	  o << urlComponents[1];
+
+	  if (!xrdCgi.empty())
+	  {
+	    o << '&' << xrdCgi;
+	    pRedirectUrl += '&';
+            pRedirectUrl += xrdCgi;
+	  }
+
+	  cgiURL = URL( o.str() );
+	}
+	else {
+	  if (!xrdCgi.empty())
+	  {
+	    std::ostringstream o;
+	    o << "fake://fake:111//fake?";
+	    o << xrdCgi;
+	    cgiURL = URL( o.str() );
+	    pRedirectUrl += '?';
+	    pRedirectUrl += xrdCgi;
+	  }
+	}
 
         //----------------------------------------------------------------------
         // Check if we need to return the URL as a response
@@ -496,17 +580,32 @@ namespace XrdCl
         }
 
         //----------------------------------------------------------------------
-        // Register a task to resend the message in some seconds
+        // Register a task to resend the message in some seconds, if we still
+        // have time to do that, and report a timeout otherwise
         //----------------------------------------------------------------------
-        TaskManager *taskMgr = pPostMaster->GetTaskManager();
-        taskMgr->RegisterTask( new WaitTask( this ),
-                               ::time(0)+waitSeconds );
+        time_t resendTime = ::time(0)+waitSeconds;
+
+        if( resendTime < pExpiration )
+        {
+          TaskManager *taskMgr = pPostMaster->GetTaskManager();
+          taskMgr->RegisterTask( new WaitTask( this ), resendTime );
+        }
+        else
+        {
+          log->Debug( XRootDMsg, "[%s] Wait time is too long, timing out %s",
+                      pUrl.GetHostId().c_str(),
+                      pRequest->GetDescription().c_str() );
+          pStatus   = Status( stError, errOperationExpired );
+          HandleResponse();
+        }
         return;
       }
 
       //------------------------------------------------------------------------
-      // kXR_waitresp - the response will be returned in some seconds
-      // as an unsolicited message
+      // kXR_waitresp - the response will be returned in some seconds as an
+      // unsolicited message. Currently all messages of this type are handled
+      // one step before in the XrdClStream::OnIncoming as they need to be
+      // processed synchronously.
       //------------------------------------------------------------------------
       case kXR_waitresp:
       {
@@ -797,6 +896,12 @@ namespace XrdCl
       //------------------------------------------------------------------------
       if( !st.IsOK() )
         return st;
+
+      //------------------------------------------------------------------------
+      // If we are not done reading the header, return back to the event loop.
+      //------------------------------------------------------------------------
+      if( st.IsOK() && st.code != suDone )
+        return st;
     }
 
     //--------------------------------------------------------------------------
@@ -1031,7 +1136,11 @@ namespace XrdCl
       if( pStatus.code == errErrorResponse )
       {
         st->errNo = rsp->body.error.errnum;
-        st->SetErrorMessage( rsp->body.error.errmsg );
+        char *errmsg = new char[rsp->hdr.dlen-3];
+        errmsg[rsp->hdr.dlen-4] = 0;
+        memcpy( errmsg, rsp->body.error.errmsg, rsp->hdr.dlen-4 );
+        st->SetErrorMessage( errmsg );
+        delete [] errmsg;
       }
       else if( pStatus.code == errRedirect )
         st->SetErrorMessage( pRedirectUrl );
@@ -1465,14 +1574,50 @@ namespace XrdCl
     pSidMgr->ReleaseSID( req->header.streamid );
     pSidMgr = 0;
     AnyObject sidMgrObj;
-    st = pPostMaster->QueryTransport( pUrl, XRootDQuery::SIDManager,
-                                      sidMgrObj );
+    // Append any "xrd.*" parameters present in newCgi so that any authentication
+    // requirements are properly enforced
+    std::string xrdCgi = "";
+    std::ostringstream ossXrd;
+    for(URL::ParamsMap::const_iterator it = newCgi.begin();
+	it != newCgi.end(); ++it )
+    {
+      if( it->first.compare( 0, 4, "xrd." ) )
+	continue;
+
+      ossXrd << it->first << '=' << it->second << '&';
+    }
+
+    xrdCgi = ossXrd.str();
+    // Redirection URL containing also any original xrd.* opaque parameters
+    XrdCl::URL authUrl;
+
+    if (xrdCgi.empty())
+    {
+      authUrl = pUrl;
+    }
+    else
+    {
+      std::string surl = pUrl.GetURL();
+      (surl.find('?') == std::string::npos) ? (surl += '?') :
+	((*surl.rbegin() != '&') ? (surl += '&') : (surl += ""));
+      surl += xrdCgi;
+
+      if (!authUrl.FromString(surl))
+      {
+	log->Error( XRootDMsg, "[%s] Failed to build redirection url from data:"
+		    "%s", surl.c_str());
+	return Status(stError, errInvalidRedirectURL);
+      }
+    }
+
+    st = pPostMaster->QueryTransport( authUrl, XRootDQuery::SIDManager,
+				      sidMgrObj );
 
     if( !st.IsOK() )
     {
       log->Error( XRootDMsg, "[%s] Impossible to send message %s.",
-                  pUrl.GetHostId().c_str(),
-                  pRequest->GetDescription().c_str() );
+		  pUrl.GetHostId().c_str(),
+		  pRequest->GetDescription().c_str() );
       return st;
     }
 
@@ -1481,8 +1626,8 @@ namespace XrdCl
     if( !st.IsOK() )
     {
       log->Error( XRootDMsg, "[%s] Impossible to send message %s.",
-                  pUrl.GetHostId().c_str(),
-                  pRequest->GetDescription().c_str() );
+		  pUrl.GetHostId().c_str(),
+		  pRequest->GetDescription().c_str() );
       return st;
     }
 
@@ -1660,7 +1805,7 @@ namespace XrdCl
       return;
 
     Log *log = DefaultEnv::GetLog();
-    log->Error( XRootDMsg, "[%s] Handling error while processing %s: %s.",
+    log->Debug( XRootDMsg, "[%s] Handling error while processing %s: %s.",
                 pUrl.GetHostId().c_str(), pRequest->GetDescription().c_str(),
                 status.ToString().c_str() );
 
@@ -1679,11 +1824,12 @@ namespace XrdCl
           (status.errNo == kXR_FSError || status.errNo == kXR_IOError ||
           status.errNo == kXR_ServerError || status.errNo == kXR_NotFound) )
       {
-        UpdateTriedCGI();
+        UpdateTriedCGI(status.errNo);
         if( status.errNo == kXR_NotFound )
           SwitchOnRefreshFlag();
         HandleError( RetryAtServer( pLoadBalancer.url ) );
         delete pResponse;
+        pResponse = 0;
         return;
       }
       else
@@ -1741,18 +1887,50 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   Status XRootDMsgHandler::RetryAtServer( const URL &url )
   {
+    if( pUrl.GetHostId() != url.GetHostId() )
+      pHosts->push_back( url );
     pUrl = url;
-    pHosts->push_back( pUrl );
     return pPostMaster->Send( pUrl, pRequest, this, true, pExpiration );
   }
 
   //----------------------------------------------------------------------------
   // Update the "tried=" part of the CGI of the current message
   //----------------------------------------------------------------------------
-  void XRootDMsgHandler::UpdateTriedCGI()
+  void XRootDMsgHandler::UpdateTriedCGI(uint32_t errNo)
   {
     URL::ParamsMap cgi;
-    cgi["tried"] = pUrl.GetHostName();
+    std::string    tried = pUrl.GetHostName();
+
+    // Report the reason for the failure to the next location
+    //
+    if (errNo)
+       {     if (errNo == kXR_NotFound)     cgi["triedrc"] = "enoent";
+        else if (errNo == kXR_IOError)      cgi["triedrc"] = "ioerr";
+        else if (errNo == kXR_FSError)      cgi["triedrc"] = "fserr";
+        else if (errNo == kXR_ServerError)  cgi["triedrc"] = "srverr";
+       }
+
+    //--------------------------------------------------------------------------
+    // If our current load balancer is a metamanager and we failed either
+    // at a diskserver or at an unidentified node we also exclude the last
+    // known manager
+    //--------------------------------------------------------------------------
+    if( pLoadBalancer.url.IsValid() && (pLoadBalancer.flags & kXR_attrMeta) )
+    {
+      HostList::reverse_iterator it;
+      for( it = pHosts->rbegin()+1; it != pHosts->rend(); ++it )
+      {
+        if( it->loadBalancer )
+          break;
+
+        tried += "," + it->url.GetHostName();
+
+        if( it->flags & kXR_isManager )
+          break;
+      }
+    }
+
+    cgi["tried"] = tried;
     XRootDTransport::UnMarshallRequest( pRequest );
     MessageUtils::RewriteCGIAndPath( pRequest, cgi, false, "" );
     XRootDTransport::MarshallRequest( pRequest );

@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <iomanip>
 #include <sys/param.h>
 #include <sys/types.h>
 
@@ -98,6 +99,7 @@ XrdSecProtocol *XrdSecGetProtocol(const char             *hostname,
 // Perform any required debugging
 //
    DEBUG("protocol request for host " <<hostname <<" token='"
+         <<(parms.size > 0 ? setw(parms.size) : setw(1))
          <<(parms.size > 0 ? parms.buffer : "") <<"'");
 
 // Check if the server wants no security.
@@ -106,7 +108,7 @@ XrdSecProtocol *XrdSecGetProtocol(const char             *hostname,
 
 // Find a supported protocol.
 //
-   if (!(protp = PManager.Get(hostname, endPoint, parms)))
+   if (!(protp = PManager.Get(hostname, endPoint, parms, einfo)))
       {if (einfo) einfo->setErrInfo(ENOPROTOOPT, noperr);
          else cerr <<noperr <<endl;
       }

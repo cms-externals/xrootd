@@ -47,6 +47,7 @@
 #define SFS_O_RDWR             2         // open read/write
 #define SFS_O_CREAT        0x100         // used for file creation
 #define SFS_O_TRUNC        0x200         // used for file truncation
+#define SFS_O_MULTIW       0x400         // used for multi-write locations
 #define SFS_O_POSC     0x0100000         // persist on successful close
 #define SFS_O_FORCE    0x0200000         // used for locate only
 #define SFS_O_HNAME    0x0400000         // used for locate only
@@ -100,6 +101,7 @@
 #define SFS_REDIRECT   -256 // ErrInfo code -> Port number to redirect to
 #define SFS_STARTED    -512 // ErrInfo code -> Estimated seconds to completion
 #define SFS_DATA      -1024 // ErrInfo code -> Length of data
+#define SFS_DATAVEC   -2048 // ErrInfo code -> Num iovec elements in msgbuff
 
 // The following macros are used for dealing with special local paths
 //
@@ -584,12 +586,36 @@ virtual               ~XrdSfsFileSystem() {}
     @return Pointer to the file system object to be used or nil if an error
             occurred.
 
-   extern "C"
+    extern "C"
          {XrdSfsFileSystem *XrdSfsGetFileSystem(XrdSfsFileSystem *nativeFS,
                                                 XrdSysLogger     *Logger,
                                                 const char       *configFn);
          }
+
+    An alternate entry point may be defined in lieu of the previous entry point.
+    This normally identified by a version option in the configuration file (e.g.
+    xrootd.fslib -2 <path>). It differs in that an extra parameter is passed:
+
+    @param  envP     - Pointer to the environment containing implementation
+                       specific information.
+
+    extern "C"
+         {XrdSfsFileSystem *XrdSfsGetFileSystem2(XrdSfsFileSystem *nativeFS,
+                                                 XrdSysLogger     *Logger,
+                                                 const char       *configFn,
+                                                 XrdOucEnv        *envP);
+         }
 */
+
+typedef XrdSfsFileSystem *(*XrdSfsFileSystem_t) (XrdSfsFileSystem *nativeFS,
+                                                 XrdSysLogger     *Logger,
+                                                 const char       *configFn);
+
+typedef XrdSfsFileSystem *(*XrdSfsFileSystem2_t)(XrdSfsFileSystem *nativeFS,
+                                                 XrdSysLogger     *Logger,
+                                                 const char       *configFn,
+                                                 XrdOucEnv        *envP);
+
 //-----------------------------------------------------------------------------
   
 //------------------------------------------------------------------------------

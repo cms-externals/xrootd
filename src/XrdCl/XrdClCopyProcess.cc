@@ -1,7 +1,9 @@
 //------------------------------------------------------------------------------
-// Copyright (c) 2011-2012 by European Organization for Nuclear Research (CERN)
+// Copyright (c) 2011-2014 by European Organization for Nuclear Research (CERN)
 // Author: Lukasz Janyst <ljanyst@cern.ch>
 //------------------------------------------------------------------------------
+// This file is part of the XRootD software suite.
+//
 // XRootD is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -14,6 +16,10 @@
 //
 // You should have received a copy of the GNU Lesser General Public License
 // along with XRootD.  If not, see <http://www.gnu.org/licenses/>.
+//
+// In applying this licence, CERN does not waive the privileges and immunities
+// granted to it by virtue of its status as an Intergovernmental Organization
+// or submit itself to any jurisdiction.
 //------------------------------------------------------------------------------
 
 #include "XrdCl/XrdClCopyProcess.hh"
@@ -21,13 +27,95 @@
 #include "XrdCl/XrdClLog.hh"
 #include "XrdCl/XrdClDefaultEnv.hh"
 #include "XrdCl/XrdClClassicCopyJob.hh"
-#include "XrdCl/XrdClThirdPartyCopyJob.hh"
+#include "XrdCl/XrdClTPFallBackCopyJob.hh"
 #include "XrdCl/XrdClFileSystem.hh"
 #include "XrdCl/XrdClMonitor.hh"
 #include "XrdCl/XrdClCopyJob.hh"
 #include "XrdCl/XrdClUtils.hh"
+#include "XrdCl/XrdClJobManager.hh"
+#include "XrdCl/XrdClUglyHacks.hh"
 
 #include <sys/time.h>
+
+#include <iostream>
+
+namespace
+{
+  class QueuedCopyJob: public XrdCl::Job
+  {
+    public:
+      QueuedCopyJob( XrdCl::CopyJob             *job,
+                     XrdCl::CopyProgressHandler *progress,
+                     uint16_t                    currentJob,
+                     uint16_t                    totalJobs,
+                     XrdCl::Semaphore           *sem = 0 ):
+        pJob(job), pProgress(progress), pCurrentJob(currentJob),
+        pTotalJobs(totalJobs), pSem(sem) {}
+
+      //------------------------------------------------------------------------
+      //! Run the job
+      //------------------------------------------------------------------------
+      virtual void Run( void * )
+      {
+        XrdCl::Monitor     *mon = XrdCl::DefaultEnv::GetMonitor();
+        timeval             bTOD;
+
+        //----------------------------------------------------------------------
+        // Report beginning of the copy
+        //----------------------------------------------------------------------
+        if( pProgress )
+          pProgress->BeginJob( pCurrentJob, pTotalJobs,
+                               &pJob->GetSource(),
+                               &pJob->GetTarget() );
+
+        if( mon )
+        {
+          XrdCl::Monitor::CopyBInfo i;
+          i.transfer.origin = &pJob->GetSource();
+          i.transfer.target = &pJob->GetTarget();
+          mon->Event( XrdCl::Monitor::EvCopyBeg, &i );
+        }
+
+        gettimeofday( &bTOD, 0 );
+
+        //----------------------------------------------------------------------
+        // Do the copy
+        //----------------------------------------------------------------------
+        XrdCl::XRootDStatus st = pJob->Run( pProgress );
+        pJob->GetResults()->Set( "status", st );
+
+        //----------------------------------------------------------------------
+        // Report end of the copy
+        //----------------------------------------------------------------------
+        if( mon )
+        {
+          std::vector<std::string> sources;
+          pJob->GetResults()->Get( "sources", sources );
+          XrdCl::Monitor::CopyEInfo i;
+          i.transfer.origin = &pJob->GetSource();
+          i.transfer.target = &pJob->GetTarget();
+          i.sources         = sources.size();
+          i.bTOD            = bTOD;
+          gettimeofday( &i.eTOD, 0 );
+          i.status          = &st;
+          mon->Event( XrdCl::Monitor::EvCopyEnd, &i );
+        }
+
+        if( pProgress )
+          pProgress->EndJob( pCurrentJob, pJob->GetResults() );
+
+        if( pSem )
+          pSem->Post();
+      }
+
+    private:
+      XrdCl::CopyJob             *pJob;
+      XrdCl::CopyProgressHandler *pProgress;
+      uint16_t                    pCurrentJob;
+      uint16_t                    pTotalJobs;
+      XrdCl::Semaphore           *pSem;
+  };
+};
 
 namespace XrdCl
 {
@@ -46,6 +134,26 @@ namespace XrdCl
                                     PropertyList       *results )
   {
     Env *env = DefaultEnv::GetEnv();
+
+    //--------------------------------------------------------------------------
+    // Process a configuraion job
+    //--------------------------------------------------------------------------
+    if( properties.HasProperty( "jobType" ) &&
+        properties.Get<std::string>( "jobType" ) == "configuration" )
+    {
+      if( pJobProperties.size() > 0 &&
+          pJobProperties.rbegin()->HasProperty( "jobType" ) &&
+          pJobProperties.rbegin()->Get<std::string>( "jobType" ) == "configuration" )
+      {
+        PropertyList &config = *pJobProperties.rbegin();
+        PropertyList::PropertyMap::const_iterator it;
+        for( it = properties.begin(); it != properties.end(); ++it )
+          config.Set( it->first, it->second );
+      }
+      else
+        pJobProperties.push_back( properties );
+      return XRootDStatus();
+    }
 
     //--------------------------------------------------------------------------
     // Validate properties
@@ -136,24 +244,27 @@ namespace XrdCl
     for( it = pJobProperties.begin(); it != pJobProperties.end(); ++it, ++i )
     {
       PropertyList &props = *it;
+
+      if( props.HasProperty( "jobType" ) &&
+          props.Get<std::string>( "jobType" ) == "configuration" )
+        continue;
+
       PropertyList *res   = pJobResults[i];
       std::string tmp;
 
       props.Get( "source", tmp );
       URL source = tmp;
+      if( !source.IsValid() )
+        return XRootDStatus( stError, errInvalidArgs, 0, "invalid source" );
+
       props.Get( "target", tmp );
       URL target = tmp;
+      if( !target.IsValid() )
+        return XRootDStatus( stError, errInvalidArgs, 0, "invalid target" );
 
-      bool tpc         = false;
-      bool tpcFallBack = false;
-
+      bool tpc = false;
       props.Get( "thirdParty", tmp );
-      if( tmp == "first" )
-      {
-        tpc         = true;
-        tpcFallBack = true;
-      }
-      else if( tmp == "only" )
+      if( tmp != "none" )
         tpc = true;
 
       //------------------------------------------------------------------------
@@ -185,22 +296,9 @@ namespace XrdCl
       CopyJob *job = 0;
 
       if( tpc == true )
-      {
-        XRootDStatus st = ThirdPartyCopyJob::CanDo( source, target, &props );
-
-        if( st.IsOK() )
-          job = new ThirdPartyCopyJob( &props, res );
-        else if( tpcFallBack && !st.IsFatal() )
-          job = new ClassicCopyJob( &props, res );
-        else
-        {
-          CleanUpJobs();
-          res->Set( "status", st );
-          return st;
-        }
-      }
+        job = new TPFallBackCopyJob( i+1, &props, res );
       else
-        job = new ClassicCopyJob( &props, res );
+        job = new ClassicCopyJob( i+1, &props, res );
 
       pJobs.push_back( job );
     }
@@ -212,60 +310,91 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   XRootDStatus CopyProcess::Run( CopyProgressHandler *progress )
   {
+    //--------------------------------------------------------------------------
+    // Get the configuration
+    //--------------------------------------------------------------------------
+    uint8_t parallelThreads = 1;
+    if( pJobProperties.size() > 0 &&
+        pJobProperties.rbegin()->HasProperty( "jobType" ) &&
+        pJobProperties.rbegin()->Get<std::string>( "jobType" ) == "configuration" )
+    {
+      PropertyList &config = *pJobProperties.rbegin();
+      if( config.HasProperty( "parallel" ) )
+        parallelThreads = (uint8_t)config.Get<int>( "parallel" );
+    }
+
+    //--------------------------------------------------------------------------
+    // Run the show
+    //--------------------------------------------------------------------------
     std::vector<CopyJob *>::iterator it;
     uint16_t currentJob = 1;
     uint16_t totalJobs  = pJobs.size();
 
-    Monitor *mon = DefaultEnv::GetMonitor();
-    timeval bTOD;
-
-    for( it = pJobs.begin(); it != pJobs.end(); ++it )
+    //--------------------------------------------------------------------------
+    // Single thread
+    //--------------------------------------------------------------------------
+    if( parallelThreads == 1 )
     {
-      //------------------------------------------------------------------------
-      // Report beginning of the copy
-      //------------------------------------------------------------------------
-      if( progress )
-        progress->BeginJob( currentJob, totalJobs, &(*it)->GetSource(),
-                            &(*it)->GetTarget() );
+      XRootDStatus err;
 
-      if( mon )
+      for( it = pJobs.begin(); it != pJobs.end(); ++it )
       {
-        Monitor::CopyBInfo i;
-        i.transfer.origin = &(*it)->GetSource();
-        i.transfer.target = &(*it)->GetTarget();
-        mon->Event( Monitor::EvCopyBeg, &i );
+        QueuedCopyJob j( *it, progress, currentJob, totalJobs );
+        j.Run(0);
+
+        XRootDStatus st = (*it)->GetResults()->Get<XRootDStatus>( "status" );
+        if( err.IsOK() && !st.IsOK() )
+        {
+          err = st;
+        }
+        ++currentJob;
       }
 
-      gettimeofday( &bTOD, 0 );
-
-      //------------------------------------------------------------------------
-      // Do the copy
-      //------------------------------------------------------------------------
-      XRootDStatus st = (*it)->Run( progress );
-      (*it)->GetResults()->Set( "status", st );
-
-      //------------------------------------------------------------------------
-      // Report end of the copy
-      //------------------------------------------------------------------------
-      if( mon )
-      {
-        std::vector<std::string> sources;
-        (*it)->GetResults()->Get( "sources", sources );
-        Monitor::CopyEInfo i;
-        i.transfer.origin = &(*it)->GetSource();
-        i.transfer.target = &(*it)->GetTarget();
-        i.sources         = sources.size();
-        i.bTOD            = bTOD;
-        gettimeofday( &i.eTOD, 0 );
-        i.status          = &st;
-        mon->Event( Monitor::EvCopyEnd, &i );
-      }
-
-      if( progress )
-        progress->EndJob( (*it)->GetResults() );
-      if( !st.IsOK() ) return st;
-      ++currentJob;
+      if( !err.IsOK() ) return err;
     }
+    //--------------------------------------------------------------------------
+    // Multiple threads
+    //--------------------------------------------------------------------------
+    else
+    {
+      uint16_t workers = std::min( (uint16_t)parallelThreads,
+                                   (uint16_t)pJobs.size() );
+      JobManager jm( workers );
+      jm.Initialize();
+      if( !jm.Start() )
+        return XRootDStatus( stError, errOSError, 0,
+                             "Unable to start job manager" );
+
+      Semaphore *sem = new Semaphore(0);
+      std::vector<QueuedCopyJob*> queued;
+      for( it = pJobs.begin(); it != pJobs.end(); ++it )
+      {
+        QueuedCopyJob *j = new QueuedCopyJob( *it, progress, currentJob,
+                                              totalJobs, sem );
+
+        queued.push_back( j );
+        jm.QueueJob(j, 0);
+        ++currentJob;
+      }
+
+      std::vector<QueuedCopyJob*>::iterator itQ;
+      for( itQ = queued.begin(); itQ != queued.end(); ++itQ )
+        sem->Wait();
+      delete sem;
+
+      if( !jm.Stop() )
+        return XRootDStatus( stError, errOSError, 0,
+                             "Unable to stop job manager" );
+      jm.Finalize();
+      for( itQ = queued.begin(); itQ != queued.end(); ++itQ )
+        delete *itQ;
+
+      for( it = pJobs.begin(); it != pJobs.end(); ++it )
+      {
+        XRootDStatus st = (*it)->GetResults()->Get<XRootDStatus>( "status" );
+        if( !st.IsOK() ) return st;
+      }
+    };
     return XRootDStatus();
   }
 

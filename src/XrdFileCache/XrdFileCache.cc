@@ -21,6 +21,7 @@
 #include <sys/statvfs.h>
 
 #include "XrdCl/XrdClConstants.hh"
+#include "XrdCl/XrdClURL.hh"
 #include "XrdSys/XrdSysPthread.hh"
 #include "XrdOss/XrdOss.hh"
 #include "XrdOuc/XrdOucEnv.hh"
@@ -62,7 +63,7 @@ XrdOucCacheIO *Cache::Attach(XrdOucCacheIO *io, int Options)
          m_attached++;
       }
       IO* cio;
-      if (Factory::GetInstance().RefConfiguration().m_prefetchFileBlocks)
+      if (Factory::GetInstance().RefConfiguration().m_hdfsmode)
          cio = new IOFileBlock(*io, m_stats, *this);
       else
          cio = new IOEntireFile(*io, m_stats, *this);
@@ -99,30 +100,17 @@ void Cache::Detach(XrdOucCacheIO* io)
 //______________________________________________________________________________
 
 
-bool Cache::getFilePathFromURL(const char* url, std::string &result) const
+void Cache::getFilePathFromURL(const char* iUrl, std::string &result) const
 {
-   std::string path = url;
-   size_t split_loc = path.rfind("//");
-
-   if (split_loc == path.npos)
-      return false;
-
-   size_t kloc = path.rfind("?");
-
-   if (kloc == path.npos)
-      return false;
-
-   result = Factory::GetInstance().RefConfiguration().m_cache_dir;
-   result += path.substr(split_loc+1,kloc-split_loc-1);
-
-   return true;
+   XrdCl::URL url(iUrl);
+   result = Factory::GetInstance().RefConfiguration().m_cache_dir + url.GetPath();
 }
 
 //______________________________________________________________________________
 bool
 Cache::HaveFreeWritingSlots()
 {
-   const static size_t maxWriteWaits=100;
+   const static size_t maxWriteWaits=500;
    return s_writeQ.size < maxWriteWaits;
 }
 
@@ -131,7 +119,7 @@ Cache::HaveFreeWritingSlots()
 void
 Cache::AddWriteTask(Prefetch* p, int ri, size_t s, bool fromRead)
 {
-   XrdCl::DefaultEnv::GetLog()->Debug(XrdCl::AppMsg, "Cache::AddWriteTask() wqsize = %d, bi=%d", s_writeQ.size, ri);
+   XrdCl::DefaultEnv::GetLog()->Dump(XrdCl::AppMsg, "Cache::AddWriteTask() wqsize = %d, bi=%d", s_writeQ.size, ri);
    s_writeQ.condVar.Lock();
    if (fromRead)
       s_writeQ.queue.push_back(WriteTask(p, ri, s));

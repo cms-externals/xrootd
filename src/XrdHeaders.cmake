@@ -2,7 +2,6 @@
 install(
   FILES
   ${CMAKE_BINARY_DIR}/src/XrdVersion.hh
-  ${CMAKE_SOURCE_DIR}/src/XrdVersionPlugin.hh
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xrootd )
 
 set( XROOTD_PUBLIC_HEADERS
@@ -34,6 +33,7 @@ set( XROOTD_PUBLIC_HEADERS
   XrdNet/XrdNet.hh
   XrdNet/XrdNetAddr.hh
   XrdNet/XrdNetAddrInfo.hh
+  XrdNet/XrdNetUtils.hh
   XrdNet/XrdNetCmsNotify.hh
   XrdNet/XrdNetConnect.hh
   XrdNet/XrdNetOpts.hh
@@ -50,11 +50,13 @@ set( XROOTD_PUBLIC_HEADERS
   XrdOuc/XrdOucDLlist.hh
   XrdOuc/XrdOucEnv.hh
   XrdOuc/XrdOucErrInfo.hh
+  XrdOuc/XrdOucGMap.hh
   XrdOuc/XrdOucHash.hh
   XrdOuc/XrdOucHash.icc
   XrdOuc/XrdOucIOVec.hh
   XrdOuc/XrdOucLock.hh
   XrdOuc/XrdOucName2Name.hh
+  XrdOuc/XrdOucPinPath.hh
   XrdOuc/XrdOucRash.hh
   XrdOuc/XrdOucRash.icc
   XrdOuc/XrdOucSFVec.hh
@@ -67,6 +69,7 @@ set( XROOTD_PUBLIC_HEADERS
   XrdOuc/XrdOucUtils.hh
   XrdOuc/XrdOuca2x.hh
   XrdOuc/XrdOucEnum.hh
+  XrdOuc/XrdOucCompiler.hh
   XrdPosix/XrdPosixCallBack.hh
   XrdPosix/XrdPosixExtern.hh
   XrdPosix/XrdPosixOsDep.hh
@@ -77,6 +80,7 @@ set( XROOTD_PUBLIC_HEADERS
   XrdSfs/XrdSfsAio.hh
   XrdSfs/XrdSfsDio.hh
   XrdSfs/XrdSfsXio.hh
+  XrdSfs/XrdSfsFlags.hh
   XrdSfs/XrdSfsInterface.hh
   XrdSys/XrdSysAtomics.hh
   XrdSys/XrdSysDNS.hh
@@ -85,14 +89,18 @@ set( XROOTD_PUBLIC_HEADERS
   XrdSys/XrdSysHeaders.hh
   XrdSys/XrdSysLinuxSemaphore.hh
   XrdSys/XrdSysLogger.hh
+  XrdSys/XrdSysLogPI.hh
   XrdSys/XrdSysPlatform.hh
   XrdSys/XrdSysPlugin.hh
   XrdSys/XrdSysPthread.hh
   XrdSys/XrdSysSemWait.hh
   XrdSys/XrdSysTimer.hh
+  XrdSys/XrdSysXAttr.hh
   XrdSys/XrdSysXSLock.hh
+  XrdXml/XrdXmlReader.hh
   XrdXrootd/XrdXrootdMonData.hh
   XrdXrootd/XrdXrootdBridge.hh
+  XrdHttp/XrdHttpSecXtractor.hh
 )
 
 set( XROOTD_PRIVATE_HEADERS
@@ -113,6 +121,7 @@ set( XROOTD_PRIVATE_HEADERS
   XrdOfs/XrdOfsEvr.hh
   XrdOfs/XrdOfsHandle.hh
   XrdOfs/XrdOfsTrace.hh
+  XrdOfs/XrdOfsTPCInfo.hh
   XrdSys/XrdSysPriv.hh
 
   XrdOss/XrdOssApi.hh
@@ -120,6 +129,7 @@ set( XROOTD_PRIVATE_HEADERS
   XrdOss/XrdOssError.hh
   XrdOuc/XrdOucExport.hh
   XrdOuc/XrdOucPList.hh
+  
 )
 
 install_headers(

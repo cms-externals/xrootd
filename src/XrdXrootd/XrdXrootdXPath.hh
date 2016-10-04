@@ -35,6 +35,9 @@
 
 #define XROOTDXP_OK        1
 #define XROOTDXP_NOLK      2
+#define XROOTDXP_NOCGI     4
+#define XROOTDXP_NOSLASH   8
+#define XROOTDXP_NOMWCHK  16
   
 class XrdXrootdXPath
 {
@@ -45,12 +48,25 @@ inline int             Opts()  {return pathopt;}
 inline char           *Path()  {return path;}
 inline char           *Path(int &PLen)
                                {PLen = pathlen; return path;}
+       void            Set(int opts, const char *pathdata=0)
+                          {pathopt = opts;
+                           if (pathdata)
+                              {if (path) free(path);
+                               pathlen = strlen(pathdata);
+                               path    = strdup(pathdata);
+                              }
+                          }
 
        void            Insert(const char *pd, int popt=0, int flags=XROOTDXP_OK)
                              {XrdXrootdXPath *pp = 0, *p = next;
                               XrdXrootdXPath *newp = new XrdXrootdXPath(pd,popt,flags);
-                              while(p && newp->pathlen >= p->pathlen)
-                                   {pp = p; p = p->next;}
+                              if (popt & ~XROOTDXP_OK)
+                                 {while(p && newp->pathlen <  p->pathlen)
+                                       {pp = p; p = p->next;}
+                                 } else {
+                                  while(p && newp->pathlen >= p->pathlen)
+                                       {pp = p; p = p->next;}
+                                 }
                               newp->next = p;
                               if (pp) pp->next = newp;
                                  else     next = newp;

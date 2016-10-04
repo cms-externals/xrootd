@@ -30,7 +30,7 @@
 
 namespace XrdCl
 {
-#if defined(__linux__) && defined(HAVE_ATOMICS)
+#if defined(__linux__) && defined(HAVE_ATOMICS) && !USE_LIBC_SEMAPHORE
   typedef XrdSys::LinuxSemaphore Semaphore;
 #else
   typedef XrdSysSemaphore Semaphore;

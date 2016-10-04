@@ -41,7 +41,7 @@
 XrdCl::URL *XrdPosixAdmin::FanOut(int &num)
 {
    XrdCl::XRootDStatus            xStatus;
-   XrdCl::LocationInfo           *info;
+   XrdCl::LocationInfo           *info = 0;
    XrdCl::LocationInfo::Iterator  it;
    XrdCl::URL                    *uVec;
    XrdNetAddr netLoc;
@@ -62,7 +62,7 @@ XrdCl::URL *XrdPosixAdmin::FanOut(int &num)
 
 // Allocate an array large enough to hold this information
 //
-   if(!(i = info->GetSize())) return 0;
+   if (!(i = info->GetSize())) {delete info; return 0;}
    uVec = new XrdCl::URL[i];
 
 // Now start filling out the array
@@ -80,6 +80,7 @@ XrdCl::URL *XrdPosixAdmin::FanOut(int &num)
 
 // Make sure we can return something;
 //
+   delete info;
    if (!num) {delete [] uVec; return 0;}
    return uVec;
 }
@@ -123,7 +124,7 @@ int XrdPosixAdmin::Query(XrdCl::QueryCode::Code reqCode, void *buff, int bsz)
 /******************************************************************************/
   
 bool XrdPosixAdmin::Stat(mode_t *flags, time_t *mtime,
-                         size_t *size,  ino_t  *id)
+                         size_t *size,  ino_t  *id, dev_t *rdv)
 {
    XrdCl::XRootDStatus xStatus;
    XrdCl::StatInfo    *sInfo = 0;
@@ -137,7 +138,7 @@ bool XrdPosixAdmin::Stat(mode_t *flags, time_t *mtime,
 //
    xStatus = Xrd.Stat(Url.GetPathWithParams(), sInfo);
    if (!xStatus.IsOK()) rc = XrdPosixMap::Result(xStatus);
-      else {if (flags) *flags = XrdPosixMap::Flags2Mode(sInfo->GetFlags());
+      else {if (flags) *flags = XrdPosixMap::Flags2Mode(rdv, sInfo->GetFlags());
             if (mtime) *mtime = static_cast<time_t>(sInfo->GetModTime());
             if (size)  *size  = static_cast<size_t>(sInfo->GetSize());
             if (id)    *id    = static_cast<ino_t>(strtoll(sInfo->GetId().c_str(), 0, 10));

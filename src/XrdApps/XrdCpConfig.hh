@@ -60,6 +60,7 @@ struct defVar
        const char  *srcOpq;        // -> -OS setting (src  opaque)
        const char  *Pgm;           // -> Program name
         long long   xRate;         // -xrate value in bytes/sec   (0 if not set)
+             int    Parallel;      // Number of simultaneous copy ops (1 to 4)
              char  *pHost;         // -> SOCKS4 proxy hname       (0 if none)
              int    pPort;         //    SOCKS4 proxy port
              int    OpSpec;        // Bit mask of set options     (see Doxxxx)
@@ -101,14 +102,15 @@ static const int    OpHelp     =  'h';
 static const int    DoHelp     =  0x00000040; // -h | --help
 
 static const int    OpIfile    =  'I';
-static const int    DoIfile    =  0x00100000; // -I | --infiles
+static const int    DoIfile    =  0x00000080; // -I | --infiles
 
 static const int    OpLicense  =  'H';        // -H | --license
 
-//atic const int    DoXyzzy    =  0x00000080; // Reserved
-
 static const int    OpNoPbar   =  'N';
 static const int    DoNoPbar   =  0x00000100; // -N | --nopbar | -np {legacy}
+
+static const int    OpPath     =  'p';
+static const int    DoPath     =  0x00800000; // -p | --path
 
 static const int    OpPosc     =  'P';
 static const int    DoPosc     =  0x00000200; // -P | --posc
@@ -147,8 +149,11 @@ static const int    OpVersion  =  'V';        // -V | --version
 static const int    OpXrate    =  'X';
 static const int    DoXrate    =  0x00080000; // -X | --xrate
 
+static const int    OpParallel =  0x04;
+static const int    DoParallel =  0x00200000; //      --parallel
+
 static const int    OpDynaSrc  =  'Z';
-static const int    DoDynaSrc  =  0x00200000; //      --dynamic-src
+static const int    DoDynaSrc  =  0x00400000; //      --dynamic-src
 
 // Call Config with the parameters passed to main() to fill out this object. If
 // the method returns then no errors have been found. Otherwise, it exits.
@@ -158,6 +163,7 @@ static const int    opt1Src     = 0x00000001; // Only one source is allowed
 static const int    optNoXtnd   = 0x00000002; // Do not index source directories
 static const int    optRmtRec   = 0x00000004; // Allow remote recursive copy
 static const int    optNoStdIn  = 0x00000008; // Disallow '-' as src for stdin
+static const int    optNoLclCp  = 0x00000010; // Disallow local/local copy
 
              void   Config(int argc, char **argv, int Opts=0);
 

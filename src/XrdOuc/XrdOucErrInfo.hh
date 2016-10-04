@@ -62,7 +62,9 @@ static const int uUrlOK = 0x40000000;  //! ucap: Supports url   redirects
 static const int uMProt = 0x20000000;  //! ucap: Supports multiple protocols
 static const int uReadR = 0x10000000;  //! ucap: Supports read redirects
 static const int uIPv4  = 0x08000000;  //! ucap: Supports only IPv4 info
-static const int uPrip  = 0x04000000;  //! ucap: Client is on a private net
+static const int uIPv64 = 0x04000000;  //! ucap: Supports IPv6|IPv4 info and
+                                       //!       uIPv4 says IPv4 is prefered
+static const int uPrip  = 0x02000000;  //! ucap: Client is on a private net
 
 inline     void clear(const char *usr=0, int uc=0)
                      {code=0; ucap = uc; message[0]='\0';
@@ -237,6 +239,7 @@ inline XrdOucEICB  *getErrCB(unsigned long long &ap)
 
 inline int         getErrInfo() {return ErrInfo.code;}
 
+/*
 //-----------------------------------------------------------------------------
 //! Get a copy of the error information.
 //!
@@ -244,7 +247,6 @@ inline int         getErrInfo() {return ErrInfo.code;}
 //!
 //! @return The error code that was previously set.
 //-----------------------------------------------------------------------------
-/*
 inline int          getErrInfo(XrdOucEI &errParm)
                               {errParm = ErrInfo; return ErrInfo.code;}
 */
@@ -437,7 +439,7 @@ inline void         setUCap(int ucval) {ErrInfo.ucap = ucval;}
 //! Constructor
 //!
 //! @param  user    - Pointer to he user string in stable storage.
-//! @param  MonId   - The monitoring identifier.
+//! @param  MonID   - The monitoring identifier.
 //! @param  uc      - The user capabilities.
 //-----------------------------------------------------------------------------
 
@@ -492,7 +494,7 @@ public:
 //!                 function after the actual callback message is sent. This
 //!                 allows the callback requestor to do post-processing and be
 //!                 asynchronous being assured that the callback completed.
-//!        Path   - Optionally, the path related to thid request. It is used
+//! @param Path   - Optionally, the path related to thid request. It is used
 //!                 for tracing and detailed monitoring purposes.
 //-----------------------------------------------------------------------------
 

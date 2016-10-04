@@ -38,6 +38,16 @@ PURD_INSTANCES="default"
 XFRD_INSTANCES="default"
 
 #-------------------------------------------------------------------------------
+# Names of the instances that should run XRootD 3 versions of the executables.
+# By default XRootD 4 versions are run, however it is possible to run XRootD 3
+# if the appropriate compat packages are installed.
+#-------------------------------------------------------------------------------
+#XROOTD3_INSTANCES="default"
+#CMSD3_INSTANCES="default"
+#PURD3_INSTANCES="default"
+#XFRD3_INSTANCES="default"
+
+#-------------------------------------------------------------------------------
 # Use a custom memory allocator when the one provided with the Standard C
 # Library (glibc) is eating up too much system memory. This is almost always the
 # case for RHEL >= 6, so you may consider installing jemalloc or tcmalloc and

@@ -54,7 +54,7 @@ public:
 //-----------------------------------------------------------------------------
 //! Constructor
 //!
-//! @param  errFD     is the filedescriptor of where error messages normally
+//! @param  ErrFD     is the filedescriptor of where error messages normally
 //!                   go if this class is not used. Default is stderr.
 //! @param  xrotate   when not zero performs internal log rotatation. Otherwise,
 //!                   log rotation is suppressed. See also setRotate().
@@ -146,7 +146,7 @@ int  originalFD() {return baseFD;}
 //! Parse the keep option argument.
 //!
 //! @param  arg       Pointer to the argument. The argument syntax is:
-//!                   <count> | <size> | fifo | <signame>
+//!                   \<count\> | \<size\> | fifo | \<signame\>
 //!
 //! @return !0        Parsing succeeded. The return value is the argument that
 //!                   must be passed as the lfh parameter to Bind().
@@ -164,6 +164,13 @@ int  ParseKeep(const char *arg);
 //-----------------------------------------------------------------------------
 
 void Put(int iovcnt, struct iovec *iov);
+
+//-----------------------------------------------------------------------------
+//! Set call-out to logging plug-in on or off.
+//-----------------------------------------------------------------------------
+
+static
+void setForwarding(bool onoff) {doForward = onoff;}
 
 //-----------------------------------------------------------------------------
 //! Set log file timstamp to high resolution (hh:mm:ss.uuuu).
@@ -226,6 +233,8 @@ private:
 int         FifoMake();
 void        FifoWait();
 int         Time(char *tbuff);
+static int  TimeStamp(struct timeval &tVal, unsigned long tID,
+                      char *tbuff, int tbsz, bool hires);
 
 struct mmMsg
       {mmMsg *next;
@@ -247,6 +256,8 @@ char      *fifoFN;
 bool       hiRes;
 bool       doLFR;
 pthread_t  lfhTID;
+
+static bool doForward;
 
 void   putEmsg(char *msg, int msz);
 int    ReBind(int dorename=1);

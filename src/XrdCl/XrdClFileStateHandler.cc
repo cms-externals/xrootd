@@ -37,6 +37,7 @@
 #include "XrdCl/XrdClResponseJob.hh"
 #include "XrdCl/XrdClJobManager.hh"
 #include "XrdCl/XrdClUglyHacks.hh"
+#include "XrdClRedirectorRegistry.hh"
 
 #include <sstream>
 #include <memory>
@@ -226,6 +227,93 @@ namespace
 
 namespace XrdCl
 {
+  //------------------------------------------------------------------------
+  //! Holds a reference to a ResponceHandler
+  //! and allows to safely delete it
+  //------------------------------------------------------------------------
+  class ResponseHandlerHolder : public ResponseHandler
+  {
+    public:
+      //------------------------------------------------------------------------
+      //! Constructor
+      //------------------------------------------------------------------------
+      ResponseHandlerHolder( ResponseHandler * handler ) : pHandler( handler ), pReferenceCounter( 1 ) {}
+      //------------------------------------------------------------------------
+      //! Destructor is private - use 'Destroy' in order to delete the object
+      //! Always destroys the actual ResponseHandler and deletes itself only
+      //! if this is the last reference
+      //------------------------------------------------------------------------
+      void Destroy()
+      {
+        XrdSysMutexHelper scopedLock( pMutex );
+        // delete the actual handler
+        if( pHandler )
+        {
+          delete pHandler;
+          pHandler = 0;
+        }
+        // and than destroy myself if this is the last reference
+        DestroyMyself();
+      }
+      //------------------------------------------------------------------------
+      //! Increment reference counter
+      //------------------------------------------------------------------------
+      ResponseHandlerHolder* Self()
+      {
+        XrdSysMutexHelper scopedLock( pMutex );
+        ++pReferenceCounter;
+        return this;
+      }
+      //------------------------------------------------------------------------
+      // Handle the response
+      //------------------------------------------------------------------------
+      virtual void HandleResponseWithHosts( XrdCl::XRootDStatus *status,
+                                            XrdCl::AnyObject    *response,
+                                            XrdCl::HostList     *hostList )
+      {
+        XrdSysMutexHelper scopedLock( pMutex );
+        // delegate the job to the actual handler
+        if( pHandler )
+        {
+          pHandler->HandleResponseWithHosts( status, response, hostList );
+          // after handling a response the handler destroys itself,
+          // so we need to nullify the pointer
+          pHandler = 0;
+        }
+        // destroy the object if it is
+        DestroyMyself();
+      }
+
+    private:
+      //------------------------------------------------------------------------
+      //! Deletes itself only if this is the last reference
+      //------------------------------------------------------------------------
+      void DestroyMyself()
+      {
+        // decrement the reference counter
+        --pReferenceCounter;
+        // if the object is not used anymore delete it
+        if( pReferenceCounter == 0)
+          delete this;
+      }
+      //------------------------------------------------------------------------
+      //! Private Destructor (use 'Destroy' method)
+      //------------------------------------------------------------------------
+      ~ResponseHandlerHolder() {}
+      //------------------------------------------------------------------------
+      // The actual handler
+      //------------------------------------------------------------------------
+      ResponseHandler* pHandler;
+      //------------------------------------------------------------------------
+      // Reference counter
+      //------------------------------------------------------------------------
+      size_t pReferenceCounter;
+      //------------------------------------------------------------------------
+      // and respective mutex
+      //------------------------------------------------------------------------
+      mutable XrdSysRecMutex pMutex;
+  };
+
   //----------------------------------------------------------------------------
   // Constructor
   //----------------------------------------------------------------------------
@@ -242,7 +330,38 @@ namespace XrdCl
     pSessionId( 0 ),
     pDoRecoverRead( true ),
     pDoRecoverWrite( true ),
-    pFollowRedirects( true )
+    pFollowRedirects( true ),
+    pUseVirtRedirector( true ),
+    pReOpenHandler( 0 )
+  {
+    pFileHandle = new uint8_t[4];
+    ResetMonitoringVars();
+    DefaultEnv::GetForkHandler()->RegisterFileObject( this );
+    DefaultEnv::GetFileTimer()->RegisterFileObject( this );
+  }
+
+  //------------------------------------------------------------------------
+  //! Constructor
+  //!
+  //! @param useVirtRedirector if true Metalink files will be treated
+  //!                          as a VirtualRedirectors
+  //------------------------------------------------------------------------
+  FileStateHandler::FileStateHandler( bool useVirtRedirector ):
+    pFileState( Closed ),
+    pStatInfo( 0 ),
+    pFileUrl( 0 ),
+    pDataServer( 0 ),
+    pLoadBalancer( 0 ),
+    pStateRedirect( 0 ),
+    pFileHandle( 0 ),
+    pOpenMode( 0 ),
+    pOpenFlags( 0 ),
+    pSessionId( 0 ),
+    pDoRecoverRead( true ),
+    pDoRecoverWrite( true ),
+    pFollowRedirects( true ),
+    pUseVirtRedirector( useVirtRedirector ),
+    pReOpenHandler( 0 )
   {
     pFileHandle = new uint8_t[4];
     ResetMonitoringVars();
@@ -255,6 +374,9 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   FileStateHandler::~FileStateHandler()
   {
+    if( pReOpenHandler )
+      pReOpenHandler->Destroy();
+
     if( DefaultEnv::GetFileTimer() )
       DefaultEnv::GetFileTimer()->UnRegisterFileObject( this );
 
@@ -266,6 +388,12 @@ namespace XrdCl
       XRootDStatus st;
       MonitorClose( &st );
       ResetMonitoringVars();
+    }
+
+    if( pUseVirtRedirector && pFileUrl && pFileUrl->IsMetalink() )
+    {
+      RedirectorRegistry& registry = RedirectorRegistry::Instance();
+      registry.Release( *pFileUrl );
     }
 
     delete pStatInfo;
@@ -305,6 +433,13 @@ namespace XrdCl
     // Check if the parameters are valid
     //--------------------------------------------------------------------------
     Log *log = DefaultEnv::GetLog();
+
+    if (pFileUrl)
+    {
+      delete pFileUrl;
+      pFileUrl = 0;
+    }
+
     pFileUrl = new URL( url );
     if( !pFileUrl->IsValid() )
     {
@@ -350,7 +485,10 @@ namespace XrdCl
     Message           *msg;
     ClientOpenRequest *req;
     std::string        path = pFileUrl->GetPathWithParams();
-    MessageUtils::CreateRequest( msg, req, path.length() );
+    if( pUseVirtRedirector && pFileUrl->IsMetalink() )
+      MessageUtils::CreateRequest<VirtualMessage>( msg, req, path.length() );
+    else
+      MessageUtils::CreateRequest( msg, req, path.length() );
 
     req->requestid = kXR_open;
     req->mode      = mode;
@@ -363,6 +501,21 @@ namespace XrdCl
     MessageSendParams params; params.timeout = timeout;
     params.followRedirects = pFollowRedirects;
     MessageUtils::ProcessSendParams( params );
+
+    //--------------------------------------------------------------------------
+    // Register a virtual redirector
+    //--------------------------------------------------------------------------
+    if( pUseVirtRedirector && pFileUrl->IsMetalink() )
+    {
+      RedirectorRegistry& registry = RedirectorRegistry::Instance();
+      XRootDStatus st = registry.Register( *pFileUrl );
+      if( !st.IsOK() ) return st;
+      HostInfo info( url, true );
+      HostList *list = new HostList();
+      list->push_back( info );
+      params.loadBalancer = info;
+      params.hostList     = list;
+    }
 
     Status st = MessageUtils::SendMessage( *pFileUrl, msg, openHandler, params );
 
@@ -893,7 +1046,7 @@ namespace XrdCl
 
       pDataServer = new URL( hostList->back().url );
       pDataServer->SetParams( pFileUrl->GetParams() );
-      pDataServer->SetPath( pFileUrl->GetPath() );
+      if( !( pUseVirtRedirector && pFileUrl->IsMetalink() ) ) pDataServer->SetPath( pFileUrl->GetPath() );
       lastServer = pDataServer->GetHostId();
       HostList::const_iterator itC;
       URL::ParamsMap params = pDataServer->GetParams();
@@ -921,7 +1074,7 @@ namespace XrdCl
     // We have failed
     //--------------------------------------------------------------------------
     pStatus = *status;
-    if( !pStatus.IsOK() )
+    if( !pStatus.IsOK() || !openInfo )
     {
       log->Debug( FileMsg, "[0x%x@%s] Error while opening at %s: %s",
                   this, pFileUrl->GetURL().c_str(), lastServer.c_str(),
@@ -1199,8 +1352,8 @@ namespace XrdCl
   //------------------------------------------------------------------------
   void FileStateHandler::Tick( time_t now )
   {
-    TimeOutRequests( now );
     XrdSysMutexHelper scopedLock( pMutex );
+    TimeOutRequests( now );
   }
 
   //----------------------------------------------------------------------------
@@ -1420,21 +1573,30 @@ namespace XrdCl
                this, pFileUrl->GetURL().c_str(), url.GetURL().c_str() );
 
     //--------------------------------------------------------------------------
-    // Remove the kXR_delete and kXR_new flags, we don't want the recovery
-    // procedure to delete a file that has been partially updated or fail
-    // it because a partially uploaded file already exists
+    // Remove the kXR_delete and kXR_new flags, as we don't want the recovery
+    // procedure to delete a file that has been partially updated or fail it
+    // because a partially uploaded file already exists.
     //--------------------------------------------------------------------------
-    pOpenFlags &= ~kXR_delete;
+    if (pOpenFlags & kXR_delete)
+    {
+      pOpenFlags &= ~kXR_delete;
+      pOpenFlags |=  kXR_open_updt;
+    }
+
     pOpenFlags &= ~kXR_new;
 
     Message           *msg;
     ClientOpenRequest *req;
+    URL u = url;
 
-    URL u = *pFileUrl;
     if( !url.GetPath().empty() )
-      u.SetPath( url.GetPath() );
-    std::string        path = u.GetPathWithParams();
-    MessageUtils::CreateRequest( msg, req, path.length() );
+      u.SetPath( pFileUrl->GetPath() );
+
+    std::string path = u.GetPathWithParams();
+    if( pUseVirtRedirector && pFileUrl->IsMetalink() )
+      MessageUtils::CreateRequest<VirtualMessage>( msg, req, path.length() );
+    else
+      MessageUtils::CreateRequest( msg, req, path.length() );
 
     req->requestid = kXR_open;
     req->mode      = pOpenMode;
@@ -1442,13 +1604,47 @@ namespace XrdCl
     req->dlen      = path.length();
     msg->Append( path.c_str(), path.length(), 24 );
 
-    OpenHandler *openHandler = new OpenHandler( this, 0 );
+    // the handler has been removed from the queue
+    // (because we are here) so we can destroy it
+    if( pReOpenHandler )
+    {
+      // in principle this should not happen because reopen
+      // is triggered only from StateHandler (Stat, Write, Read, etc.)
+      // but not from Open itself but it is better to be on the save side
+      pReOpenHandler->Destroy();
+      pReOpenHandler = 0;
+    }
+    // create a new reopen handler
+    // (it is not assigned to 'pReOpenHandler' in order not to bump the reference counter
+    //  until we know that 'SendMessage' was successful)
+    ResponseHandlerHolder *openHandler = new ResponseHandlerHolder( new OpenHandler( this, 0 ) );
     MessageSendParams params; params.timeout = timeout;
     MessageUtils::ProcessSendParams( params );
     XRootDTransport::SetDescription( msg );
+
+    //--------------------------------------------------------------------------
+    // If a virtual redirector is in use, set it up in send parameters
+    //--------------------------------------------------------------------------
+    if( pUseVirtRedirector && pFileUrl->IsMetalink() )
+    {
+      HostInfo info( *pFileUrl, true );
+      HostList *list = new HostList();
+      list->push_back( info );
+      params.loadBalancer = info;
+      params.hostList     = list;
+    }
+
     Status st = MessageUtils::SendMessage( url, msg, openHandler, params );
+    // if there was a problem destroy the open handler
     if( !st.IsOK() )
-      delete openHandler;
+    {
+      openHandler->Destroy();
+    }
+    // otherwise keep the reference
+    else
+    {
+      pReOpenHandler = openHandler->Self();
+    }
     return st;
   }
 

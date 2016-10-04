@@ -1,7 +1,9 @@
 //------------------------------------------------------------------------------
-// Copyright (c) 2011-2012 by European Organization for Nuclear Research (CERN)
+// Copyright (c) 2011-2014 by European Organization for Nuclear Research (CERN)
 // Author: Lukasz Janyst <ljanyst@cern.ch>
 //------------------------------------------------------------------------------
+// This file is part of the XRootD software suite.
+//
 // XRootD is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -13,7 +15,11 @@
 // GNU General Public License for more details.
 //
 // You should have received a copy of the GNU Lesser General Public License
-// along with XRootD.  If not, see <http://www.gnu.org/licenses/>.
+// along with XRootD.  If not, see <http://www.gnu.org/licenses/>
+//
+// In applying this licence, CERN does not waive the privileges and immunities
+// granted to it by virtue of its status as an Intergovernmental Organization
+// or submit itself to any jurisdiction.
 //------------------------------------------------------------------------------
 
 #include "XrdCl/XrdClChannel.hh"
@@ -23,6 +29,7 @@
 #include "XrdCl/XrdClConstants.hh"
 #include "XrdCl/XrdClLog.hh"
 #include "XrdCl/XrdClUglyHacks.hh"
+#include "XrdCl/XrdClRedirectorRegistry.hh"
 
 #include <ctime>
 
@@ -45,7 +52,7 @@ namespace
       //------------------------------------------------------------------------
       // Destructor
       //------------------------------------------------------------------------
-      ~FilterHandler()
+      virtual ~FilterHandler()
       {
         delete pSem;
       }
@@ -97,7 +104,21 @@ namespace
         return pMsg;
       }
 
+      //------------------------------------------------------------------------
+      // Get underlying message filter sid
+      //------------------------------------------------------------------------
+      uint16_t GetSid() const
+      {
+	if (pFilter)
+	  return pFilter->GetSid();
+
+	return 0;
+      }
+
     private:
+      FilterHandler(const FilterHandler &other);
+      FilterHandler &operator = (const FilterHandler &other);
+
       XrdCl::Semaphore     *pSem;
       XrdCl::MessageFilter *pFilter;
       XrdCl::Message       *pMsg;
@@ -120,7 +141,7 @@ namespace
       //------------------------------------------------------------------------
       // Destructor
       //------------------------------------------------------------------------
-      ~StatusHandler()
+      virtual ~StatusHandler()
       {
         delete pSem;
       }
@@ -146,6 +167,9 @@ namespace
       }
       
     private:
+      StatusHandler(const StatusHandler &other);
+      StatusHandler &operator = (const StatusHandler &other);
+
       XrdCl::Semaphore *pSem;
       XrdCl::Status     pStatus;
       XrdCl::Message   *pMsg;
@@ -267,10 +291,20 @@ namespace XrdCl
   Status Channel::Send( Message              *msg,
                         OutgoingMsgHandler   *handler,
                         bool                  stateful,
-                        time_t                expires )
+                        time_t                expires,
+                        VirtualRedirector    *redirector )
 
   {
     PathID path = pTransport->Multiplex( msg, pChannelData );
+
+    if( redirector )
+    {
+      XRootDStatus st = redirector->HandleRequest( msg, pStreams[path.down] );
+      if( st.IsOK() )
+        handler->OnStatusReady( msg, Status() );
+      return st;
+    }
+
     return pStreams[path.up]->Send( msg, handler, stateful, expires );
   }
 

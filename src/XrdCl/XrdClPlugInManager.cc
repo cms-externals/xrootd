@@ -29,6 +29,7 @@
 #include "XrdCl/XrdClUtils.hh"
 #include "XrdCl/XrdClURL.hh"
 #include "XrdSys/XrdSysPwd.hh"
+#include "XrdVersion.hh"
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -146,7 +147,11 @@ namespace XrdCl
 
     std::string normUrl = NormalizeURL( url );
     if( normUrl.empty() )
-      return pDefaultFactory->factory;
+    {
+      if( pDefaultFactory )
+        return pDefaultFactory->factory;
+      return 0;
+    }
 
     std::map<std::string, FactoryHelper*>::iterator it;
     it = pFactoryMap.find( normUrl );
@@ -185,7 +190,7 @@ namespace XrdCl
       log->Debug( PlugInMgrMsg, "Loading default plug-in from %s...",
                   defaultPlugIn.c_str());
 
-      std::pair<XrdSysPlugin*, PlugInFactory *> pg = LoadFactory(
+      std::pair<XrdOucPinLoader*, PlugInFactory *> pg = LoadFactory(
         defaultPlugIn, std::map<std::string, std::string>() );
 
       if( !pg.first )
@@ -299,7 +304,7 @@ namespace XrdCl
                "enable='%s'", confFile.c_str(), url.c_str(), lib.c_str(),
                enable.c_str() );
 
-    std::pair<XrdSysPlugin*, PlugInFactory *> pg;
+    std::pair<XrdOucPinLoader*, PlugInFactory *> pg;
     pg.first = 0; pg.second = 0;
     if( enable == "true" )
     {
@@ -325,24 +330,25 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   // Load the plug-in and create the factory
   //----------------------------------------------------------------------------
-  std::pair<XrdSysPlugin*,PlugInFactory*> PlugInManager::LoadFactory(
+  std::pair<XrdOucPinLoader*,PlugInFactory*> PlugInManager::LoadFactory(
     const std::string &lib, const std::map<std::string, std::string> &config )
   {
     Log *log = DefaultEnv::GetLog();
 
     char errorBuff[1024];
-    XrdSysPlugin *pgHandler = new XrdSysPlugin( errorBuff, 1024,
-                                                lib.c_str(), lib.c_str(),
-                                                &XrdVERSIONINFOVAR( XrdCl ) );
+    XrdOucPinLoader *pgHandler = new XrdOucPinLoader( errorBuff, 1024,
+                                                      &XrdVERSIONINFOVAR( XrdCl ),
+                                                      "client", lib.c_str() );
 
-    PlugInFunc_t pgFunc = (PlugInFunc_t)pgHandler->getPlugin(
-      "XrdClGetPlugIn", false, false );
+    PlugInFunc_t pgFunc = (PlugInFunc_t)pgHandler->Resolve("XrdClGetPlugIn", -1);
 
     if( !pgFunc )
     {
       log->Debug( PlugInMgrMsg, "Error while loading %s: %s", lib.c_str(),
                   errorBuff );
-      return std::make_pair<XrdSysPlugin*, PlugInFactory*>( 0, 0 );
+      pgHandler->Unload();
+      delete pgHandler;
+      return std::make_pair<XrdOucPinLoader*, PlugInFactory*>( 0, 0 );
     }
 
     PlugInFactory *f = (PlugInFactory*)pgFunc( &config );
@@ -350,7 +356,7 @@ namespace XrdCl
     if( !f )
     {
       delete pgHandler;
-      return std::make_pair<XrdSysPlugin*, PlugInFactory*>( 0, 0 );
+      return std::make_pair<XrdOucPinLoader*, PlugInFactory*>( 0, 0 );
     }
 
     return std::make_pair( pgHandler, f );
@@ -362,7 +368,7 @@ namespace XrdCl
   bool PlugInManager::RegisterFactory( const std::string &urlString,
                                        const std::string &lib,
                                        PlugInFactory     *factory,
-                                       XrdSysPlugin      *plugin )
+                                       XrdOucPinLoader   *plugin )
   {
     //--------------------------------------------------------------------------
     // Process and normalize the URLs

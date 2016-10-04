@@ -44,7 +44,9 @@
 
 class XrdCmsBaseFR;
 class XrdCmsBaseFS;
+class XrdCmsClustID;
 class XrdCmsDrop;
+class XrdCmsManager;
 class XrdCmsPrepArgs;
 class XrdCmsRRData;
 class XrdCmsSelected;
@@ -55,26 +57,30 @@ class XrdCmsNode
 friend class XrdCmsCluster;
 public:
        char  *Ident;        // -> role hostname
-       char   isDisable;    //0 Set via admin command to temporarily remove node
-       char   isOffline;    //1 Set when a link failure occurs
-       char   isNoStage;    //2 Set upon a nostage event
-       char   isMan;        //3 Set when node acts as manager
-       char   isPeer;       //4 Set when node acts as peer manager
-       char   isProxy;      //5 Set when node acts as a proxy
-       char   isSuspend;    //6 Set upon a suspend event
+       char   hasNet;       //0 Network selection mask
+       char   isBad;        //1 Set on an event that makes it unselectable
+       char   isOffline;    //2 Set when a link failure occurs
+       char   isRW;         //3 Set when node can write or stage data
+       char   isNoStage;    //4 Set upon a nostage event
+       char   isMan;        //5 Set when node acts as manager
+       char   isPeer;       //6 Set when node acts as peer manager
        char   isBound;      //7 Set when node is in the configuration
-       char   isRW;         //0 Set when node can write or stage data
-       char   isKnown;      //1 Set when we have recieved a "state"
-       char   isConn;       //2 Set when node is network connected
-       char   isGone;       //3 Set when node must be deleted
-       char   isPerm;       //4 Set when node is permanently bound
-       char   isReserved[2];
-       char   RoleID;       // The converted XrdCmsRole::RoleID
-       char   TimeZone;     // Time zone in +UTC-
-       char   TZValid;      // Time zone has been set
+       char   isKnown;      //0 Set when we have recieved a "state"
+       char   isConn;       //1 Set when node is network connected
+       char   isGone;       //2 Set when node must be deleted
+       char   isPerm;       //3 Set when node is permanently bound
+       char   incUL;        //4 Set when unlock count nedds to be incremented
+       char   RoleID;       //5 The converted XrdCmsRole::RoleID
+       char   TimeZone;     //6 Time zone in +UTC-
+       char   TZValid;      //7 Time zone has been set
 
-static const char allowsRW = 0x01; // in isRW -> Server allows r/w access
-static const char allowsSS = 0x02; // in isRW -> Server can stage data
+static const char isBlisted  = 0x01; // in isBad -> Node is black listed
+static const char isDisabled = 0x02; // in isBad -> Node is disable (internal)
+static const char isSuspend  = 0x04; // in isBad -> Node is suspended via event
+static const char isDoomed   = 0x08; // in isBad -> Node socket must be closed
+
+static const char allowsRW   = 0x01; // in isRW  -> Server allows r/w access
+static const char allowsSS   = 0x02; // in isRW  -> Server can stage data
 
 unsigned int    DiskTotal;    // Total disk space in GB
          int    DiskNums;     // Number of file systems
@@ -91,7 +97,8 @@ const  char  *do_Have(XrdCmsRRData &Arg);
 const  char  *do_Load(XrdCmsRRData &Arg);
 const  char  *do_Locate(XrdCmsRRData &Arg);
 static int    do_LocFmt(char *buff, XrdCmsSelected *sP,
-                        SMask_t pf, SMask_t wf, bool lsall=false);
+                        SMask_t pf, SMask_t wf,
+                        bool lsall=false, bool lsuniq=false);
 const  char  *do_Mkdir(XrdCmsRRData &Arg);
 const  char  *do_Mkpath(XrdCmsRRData &Arg);
 const  char  *do_Mv(XrdCmsRRData &Arg);
@@ -115,6 +122,8 @@ const  char  *do_Try(XrdCmsRRData &Arg);
 const  char  *do_Update(XrdCmsRRData &Arg);
 const  char  *do_Usage(XrdCmsRRData &Arg);
 
+       void   Delete(XrdSysMutex &gMutex);
+
        void   Disc(const char *reason=0, int needLock=1);
 
 inline int    ID(int &INum) {INum = Instance; return NodeID;}
@@ -134,8 +143,21 @@ inline char  *Name()   {return (myName ? myName : (char *)"?");}
 
 inline SMask_t Mask() {return NodeMask;}
 
-inline void    Lock() {myMutex.Lock(); isLocked = 1;}
-inline void  UnLock() {isLocked = 0; myMutex.UnLock();}
+inline void    Lock(bool doinc)
+                   {if (!doinc) nodeMutex.Lock();
+                       else    {lkCount++;  // Global lock must be held
+                                nodeMutex.Lock();
+                                incUL = 1;
+                               }
+                    isLocked = 1;
+                   }
+inline void  UnLock() {isLocked = 0;
+                       if (incUL)
+                          {ulCount++; incUL = 0;
+                           if (isGone) nodeMutex.Signal();
+                          }
+                       nodeMutex.UnLock();
+                      }
 
 static void  Report_Usage(XrdLink *lp);
 
@@ -143,6 +165,8 @@ inline int   Send(const char *buff, int blen=0)
                  {return (isOffline ? -1 : Link->Send(buff, blen));}
 inline int   Send(const struct iovec *iov, int iovcnt, int iotot=0)
                  {return (isOffline ? -1 : Link->Send(iov, iovcnt, iotot));}
+
+       void  setManager(XrdCmsManager *mP) {Manager = mP;}
 
        void  setName(XrdLink *lnkp, const char *theIF, int port);
 
@@ -158,8 +182,12 @@ inline int   Send(const struct iovec *iov, int iovcnt, int iotot=0)
                       return TimeZone;
                      }
 
+        void setVersion(unsigned short vnum) {myVersion = vnum;}
+
 inline void  setSlot(short rslot) {RSlot = rslot;}
 inline short getSlot() {return RSlot;}
+
+inline void  ShowIF() {netIF.Display("=====> ");}
 
        void  SyncSpace();
 
@@ -171,24 +199,31 @@ private:
 static const int fsL2PFail1 = 999991;
 static const int fsL2PFail2 = 999992;
 
+       void  DeleteWarn(XrdSysMutex &gMutex, unsigned int &lkVal);
        int   fsExec(XrdOucProg *Prog, char *Arg1, char *Arg2=0);
 const  char *fsFail(const char *Who, const char *What, const char *Path, int rc);
        int   getMode(const char *theMode, mode_t &Mode);
        int   getSize(const char *theSize, long long &Size);
 
-XrdSysMutex        myMutex;
+XrdSysCondVar      nodeMutex;
+unsigned int       lkCount;  // Only Modified with global lock held
+unsigned int       ulCount;  // Only Modified with node   lock held
+
 XrdLink           *Link;
 XrdNetAddr         netID;
 XrdNetIF           netIF;
+XrdCmsManager     *Manager;
 XrdCmsNode        *Next;
 time_t             DropTime;
 XrdCmsDrop        *DropJob;  
 
+XrdCmsClustID     *cidP;
 SMask_t            NodeMask;
 int                NodeID;
 int                Instance;
 int                myLevel;
-int                myCNUM;
+short              subsPort;     // Subscription port number
+unsigned short     myVersion;
 char              *myCID;
 char              *myNID;
 char              *myName;

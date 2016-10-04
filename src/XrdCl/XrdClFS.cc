@@ -54,7 +54,10 @@ XRootDStatus BuildPath( std::string &newPath, Env *env,
   if( path.empty() )
     return XRootDStatus( stError, errInvalidArgs );
 
-  if( path[0] == '/' )
+  int noCwd = 0;
+  env->GetInt( "NoCWD", noCwd );
+
+  if( path[0] == '/' || noCwd )
   {
     newPath = path;
     return XRootDStatus();
@@ -167,6 +170,11 @@ XRootDStatus DoCD( FileSystem                      *fs,
     log->Error( AppMsg, "Invalid arguments. Expected a path." );
     return XRootDStatus( stError, errInvalidArgs );
   }
+
+  //----------------------------------------------------------------------------
+  // cd excludes NoCWD
+  //----------------------------------------------------------------------------
+  env->PutInt( "NoCWD", 0 );
 
   std::string newPath;
   if( !BuildPath( newPath, env, args[1] ).IsOK() )
@@ -632,8 +640,10 @@ XRootDStatus DoLocate( FileSystem                      *fs,
       flags |= OpenFlags::NoWait;
     else if( args[i] == "-r" )
       flags |= OpenFlags::Refresh;
-    else if( args[i] == "-m" )
+    else if( args[i] == "-m" || args[i] == "-h" )
       flags |= OpenFlags::PrefName;
+    else if( args[i] == "-i" )
+      flags |= OpenFlags::Force;
     else if( args[i] == "-d" )
       doDeepLocate = true;
     else if( !hasPath )
@@ -754,13 +764,14 @@ XRootDStatus ProcessStatQuery( StatInfo *info, const std::string &query )
   // Initialize flag translation map and check the input flags
   //----------------------------------------------------------------------------
   std::map<std::string, StatInfo::Flags> flagMap;
-  flagMap["XBitSet"]     = StatInfo::XBitSet;
-  flagMap["IsDir"]       = StatInfo::IsDir;
-  flagMap["Other"]       = StatInfo::Other;
-  flagMap["Offline"]     = StatInfo::Offline;
-  flagMap["POSCPending"] = StatInfo::POSCPending;
-  flagMap["IsReadable"]  = StatInfo::IsReadable;
-  flagMap["IsWritable"]  = StatInfo::IsWritable;
+  flagMap["XBitSet"]      = StatInfo::XBitSet;
+  flagMap["IsDir"]        = StatInfo::IsDir;
+  flagMap["Other"]        = StatInfo::Other;
+  flagMap["Offline"]      = StatInfo::Offline;
+  flagMap["POSCPending"]  = StatInfo::POSCPending;
+  flagMap["IsReadable"]   = StatInfo::IsReadable;
+  flagMap["IsWritable"]   = StatInfo::IsWritable;
+  flagMap["BackUpExists"] = StatInfo::BackUpExists;
 
   std::vector<std::string>::iterator it;
   for( it = queryFlags.begin(); it != queryFlags.end(); ++it )
@@ -872,6 +883,8 @@ XRootDStatus DoStat( FileSystem                      *fs,
     flags += "IsReadable|";
   if( info->TestFlags( StatInfo::IsWritable ) )
     flags += "IsWritable|";
+  if( info->TestFlags( StatInfo::BackUpExists ) )
+    flags += "BackUpExists|";
 
   if( !flags.empty() )
     flags.erase( flags.length()-1, 1 );
@@ -879,6 +892,7 @@ XRootDStatus DoStat( FileSystem                      *fs,
   std::cout << "Path:   " << fullPath << std::endl;
   std::cout << "Id:     " << info->GetId() << std::endl;
   std::cout << "Size:   " << info->GetSize() << std::endl;
+  std::cout << "MTime:  " << info->GetModTimeAsString() << std::endl;
   std::cout << "Flags:  " << info->GetFlags() << " (" << flags << ")";
   std::cout << std::endl;
   if( query.length() != 0 )
@@ -934,19 +948,19 @@ XRootDStatus DoStatVFS( FileSystem                      *fs,
   //----------------------------------------------------------------------------
   // Print the result
   //----------------------------------------------------------------------------
-  std::cout << "Path:                             ";
+  std::cout << "Path:                               ";
   std::cout << fullPath << std::endl;
-  std::cout << "Nodes with RW space:              ";
+  std::cout << "Nodes with RW space:                ";
   std::cout << info->GetNodesRW() << std::endl;
-  std::cout << "Size of RW space (MB):            ";
+  std::cout << "Size of largest RW space (MB):      ";
   std::cout << info->GetFreeRW() << std::endl;
-  std::cout << "Utilization of RW space (%):      ";
+  std::cout << "Utilization of RW space (%):        ";
   std::cout << (uint16_t)info->GetUtilizationRW() << std::endl;
-  std::cout << "Nodes with staging space:         ";
+  std::cout << "Nodes with staging space:           ";
   std::cout << info->GetNodesStaging() << std::endl;
-  std::cout << "Size of staging space (MB):       ";
+  std::cout << "Size of largest staging space (MB): ";
   std::cout << info->GetFreeStaging() << std::endl;
-  std::cout << "Utilization of staging space (%): ";
+  std::cout << "Utilization of staging space (%):   ";
   std::cout << (uint16_t)info->GetUtilizationStaging() << std::endl;
 
   delete info;
@@ -981,7 +995,7 @@ XRootDStatus DoQuery( FileSystem                      *fs,
     qCode = QueryCode::Checksum;
   else if( args[1] == "opaque" )
     qCode = QueryCode::Opaque;
-  else if( args[1] == "opaqueFile" )
+  else if( args[1] == "opaquefile" )
     qCode = QueryCode::OpaqueFile;
   else if( args[1] == "prepare" )
     qCode = QueryCode::Prepare;
@@ -1091,6 +1105,12 @@ XRootDStatus DoPrepare( FileSystem                      *fs,
       files.push_back( args[i] );
   }
 
+  if( files.empty() )
+  {
+    log->Error( AppMsg, "Filename missing." );
+    return XRootDStatus( stError, errInvalidArgs );
+  }
+
   //----------------------------------------------------------------------------
   // Run the command
   //----------------------------------------------------------------------------
@@ -1120,16 +1140,17 @@ class ProgressDisplay: public XrdCl::CopyProgressHandler
     //--------------------------------------------------------------------------
     // End job
     //--------------------------------------------------------------------------
-    virtual void EndJob( const XrdCl::PropertyList *results )
+    virtual void EndJob( uint16_t jobNum, const XrdCl::PropertyList *results )
     {
-      JobProgress( pBytesProcessed, pBytesTotal );
+      JobProgress( jobNum, pBytesProcessed, pBytesTotal );
       std::cerr << std::endl;
     }
 
     //--------------------------------------------------------------------------
     // Job progress
     //--------------------------------------------------------------------------
-    virtual void JobProgress( uint64_t bytesProcessed,
+    virtual void JobProgress( uint16_t jobNum,
+                              uint64_t bytesProcessed,
                               uint64_t bytesTotal )
     {
       pBytesProcessed = bytesProcessed;
@@ -1338,8 +1359,9 @@ XRootDStatus DoTail( FileSystem                      *fs,
   }
 
   StatInfo *info = 0;
-  file.Stat( false, info );
-  uint64_t size = info->GetSize();
+  uint64_t size = 0;
+  st = file.Stat( false, info );
+  if (st.IsOK()) size = info->GetSize();
 
   if( size < offset )
     offset = 0;
@@ -1379,7 +1401,7 @@ XRootDStatus DoTail( FileSystem                      *fs,
   }
   delete [] buffer;
 
-  file.Close();
+  XRootDStatus stC = file.Close();
 
   return XRootDStatus();
 }
@@ -1422,6 +1444,8 @@ XRootDStatus DoSpaceInfo( FileSystem                      *fs,
   std::cout << "Free:               " << i->GetFree()             << std::endl;
   std::cout << "Used:               " << i->GetUsed()             << std::endl;
   std::cout << "Largest free chunk: " << i->GetLargestFreeChunk() << std::endl;
+
+  delete i;
   return XRootDStatus();
 }
 
@@ -1431,61 +1455,80 @@ XRootDStatus DoSpaceInfo( FileSystem                      *fs,
 XRootDStatus PrintHelp( FileSystem *, Env *,
                         const FSExecutor::CommandParams & )
 {
-  printf( "Usage:\n"                                                        );
-  printf( "   xrdfs host[:port]              - interactive mode\n"       );
-  printf( "   xrdfs host[:port] command args - batch mode\n\n"           );
+  printf( "Usage:\n"                                                          );
+  printf( "   xrdfs [--no-cwd] host[:port]              - interactive mode\n" );
+  printf( "   xrdfs            host[:port] command args - batch mode\n\n"     );
 
-  printf( "Available commands:\n\n"                                         );
+  printf( "Available options:\n\n"                                            );
 
-  printf( "   exit\n"                                                       );
-  printf( "     Exits from the program.\n\n"                                );
+  printf( "   --no-cwd no CWD is being preset\n\n"                            );
 
-  printf( "   help\n"                                                       );
-  printf( "     This help screen.\n\n"                                      );
+  printf( "Available commands:\n\n"                                           );
 
-  printf( "   cd <path>\n"                                                  );
-  printf( "     Change the current working directory\n\n"                   );
+  printf( "   exit\n"                                                         );
+  printf( "     Exits from the program.\n\n"                                  );
 
-  printf( "   chmod <path> <user><group><other>\n"                          );
-  printf( "     Modify permissions. Permission string example:\n"           );
-  printf( "     rwxr-x--x\n\n"                                              );
+  printf( "   help\n"                                                         );
+  printf( "     This help screen.\n\n"                                        );
 
-  printf( "   ls [-l] [-u] [dirname]\n"                                     );
-  printf( "     Get directory listing.\n"                                   );
-  printf( "     -l stat every entry and pring long listing\n"               );
-  printf( "     -u print paths as URLs\n\n"                                 );
+  printf( "   cd <path>\n"                                                    );
+  printf( "     Change the current working directory\n\n"                     );
 
-  printf( "   locate [-n] [-r] [-d] <path>\n"                               );
-  printf( "     Get the locations of the path.\n"                           );
-  printf( "     -r refresh, don't use cached locations\n"                   );
-  printf( "     -n make the server return the response immediately even\n"  );
-  printf( "        though it may be incomplete\n"                           );
-  printf( "     -d do a recursive (deep) locate\n"                          );
-  printf( "     -m prefer host names to IP addresses\n\n"                   );
+  printf( "   chmod <path> <user><group><other>\n"                            );
+  printf( "     Modify permissions. Permission string example:\n"             );
+  printf( "     rwxr-x--x\n\n"                                                );
 
-  printf( "   mkdir [-p] [-m<user><group><other>] <dirname>\n"              );
-  printf( "     Creates a directory/tree of directories.\n\n"               );
+  printf( "   ls [-l] [-u] [dirname]\n"                                       );
+  printf( "     Get directory listing.\n"                                     );
+  printf( "     -l stat every entry and pring long listing\n"                 );
+  printf( "     -u print paths as URLs\n\n"                                   );
 
-  printf( "   mv <path1> <path2>\n"                                         );
-  printf( "     Move path1 to path2 locally on the same server.\n\n"        );
+  printf( "   locate [-n] [-r] [-d] <path>\n"                                 );
+  printf( "     Get the locations of the path.\n"                             );
+  printf( "     -r refresh, don't use cached locations\n"                     );
+  printf( "     -n make the server return the response immediately even\n"    );
+  printf( "        though it may be incomplete\n"                             );
+  printf( "     -d do a recursive (deep) locate\n"                            );
+  printf( "     -m|-h prefer host names to IP addresses\n"                    );
+  printf( "     -i ignore network dependencies\n\n"                           );
 
-  printf( "   stat [-q query] <path>\n"                                     );
-  printf( "     Get info about the file or directory.\n"                    );
-  printf( "     -q query optional flag query parameter that makes\n"        );
-  printf( "              xrdfs return error code to the shell if the\n"     );
-  printf( "              requested flag combination is not present;\n"      );
-  printf( "              flags may be combined together using '|' or '&'\n" );
-  printf( "              Available flags:\n"                                );
-  printf( "              XBitSet, IsDir, Other, Offline, POSCPending,\n"    );
-  printf( "              IsReadable, IsWriteable\n\n"                       );
+  printf( "   mkdir [-p] [-m<user><group><other>] <dirname>\n"                );
+  printf( "     Creates a directory/tree of directories.\n\n"                 );
 
-  printf( "   statvfs <path>\n"                                             );
-  printf( "     Get info about a virtual file system.\n\n"                  );
+  printf( "   mv <path1> <path2>\n"                                           );
+  printf( "     Move path1 to path2 locally on the same server.\n\n"          );
 
-  printf( "   query <code> <parms>\n"                                       );
-  printf( "     Obtain server information. Query codes:\n\n"                );
+  printf( "   stat [-q query] <path>\n"                                       );
+  printf( "     Get info about the file or directory.\n"                      );
+  printf( "     -q query optional flag query parameter that makes\n"          );
+  printf( "              xrdfs return error code to the shell if the\n"       );
+  printf( "              requested flag combination is not present;\n"        );
+  printf( "              flags may be combined together using '|' or '&'\n"   );
+  printf( "              Available flags:\n"                                  );
+  printf( "              XBitSet, IsDir, Other, Offline, POSCPending,\n"      );
+  printf( "              IsReadable, IsWriteable\n\n"                         );
 
-  printf( "     config         <what>   Server configuration\n"             );
+  printf( "   statvfs <path>\n"                                               );
+  printf( "     Get info about a virtual file system.\n\n"                    );
+
+  printf( "   query <code> <parms>\n"                                         );
+  printf( "     Obtain server information. Query codes:\n\n"                  );
+
+  printf( "     config         <what>   Server configuration; <what> is\n"    );
+  printf( "                             one of the following:\n"              );
+  printf( "                               bind_max      - the maximum number of parallel streams\n"  );
+  printf( "                               chksum        - the supported checksum\n"                  );
+  printf( "                               pio_max       - maximum number of parallel I/O requests\n" );
+  printf( "                               readv_ior_max - maximum size of a readv element\n"         );
+  printf( "                               readv_iov_max - maximum number of readv entries\n"         );
+  printf( "                               tpc           - support for third party copies\n"          );
+  printf( "                               wan_port      - the port to use for wan copies\n"          );
+  printf( "                               wan_window    - the wan_port window size\n"                );
+  printf( "                               window        - the tcp window size\n"                     );
+  printf( "                               cms           - the status of the cmsd\n"                  );
+  printf( "                               role          - the role in a cluster\n"                   );
+  printf( "                               sitename      - the site name\n"                           );
+  printf( "                               version       - the version of the server\n"               );
   printf( "     checksumcancel <path>   File checksum cancellation\n"       );
   printf( "     checksum       <path>   File checksum\n"                    );
   printf( "     opaque         <arg>    Implementation dependent\n"         );
@@ -1568,9 +1611,16 @@ FSExecutor *CreateExecutor( const URL &url )
 //------------------------------------------------------------------------------
 // Execute command
 //------------------------------------------------------------------------------
-int ExecuteCommand( FSExecutor *ex, const std::string &commandline )
+int ExecuteCommand( FSExecutor *ex, int argc, char **argv )
 {
-  XRootDStatus st = ex->Execute( commandline );
+  // std::vector<std::string> args (argv, argv + argc);
+  std::vector<std::string> args;
+  args.reserve(argc);
+  for (int i = 0; i < argc; ++i)
+  {
+    args.push_back(argv[i]);
+  }
+  XRootDStatus st = ex->Execute( args );
   if( !st.IsOK() )
     std::cerr << st.ToStr() << std::endl;
   return st.GetShellCode();
@@ -1628,10 +1678,72 @@ std::string BuildPrompt( Env *env, const URL &url )
   return prompt.str();
 }
 
+//------------------------------------------------------------------------
+//! parse command line
+//!
+//! @ result : command parameters
+//! @ input  : string containing the command line
+//! @ return : true if the command has been completed, false otherwise
+//------------------------------------------------------------------------
+bool getArguments (std::vector<std::string> & result, const std::string &input)
+{
+  // the delimiter (space in the case of command line)
+  static const char delimiter = ' ';
+  // two types of quotes: single and double quotes
+  const char singleQuote = '\'', doubleQuote = '\"';
+  // if the current character of the command has been
+  // quoted 'currentQuote' holds the type of quote,
+  // otherwise it holds the null character
+  char currentQuote = '\0';
+
+  std::string tmp;
+  for (std::string::const_iterator it = input.begin (); it != input.end (); ++it)
+  {
+    // if we encountered a quote character ...
+    if (*it == singleQuote || *it == doubleQuote)
+    {
+      // if we are not within quoted text ...
+      if (!currentQuote)
+      {
+        currentQuote = *it; // set the type of quote
+        continue; // and continue, the quote character itself is not a part of the parameter
+      }
+      // otherwise if it is the closing quote character ...
+      else if (currentQuote == *it)
+      {
+        currentQuote = '\0'; // reset the current quote type
+        continue; // and continue, the quote character itself is not a part of the parameter
+      }
+    }
+    // if we are within quoted text or the character is not a delimiter ...
+    if (currentQuote || *it != delimiter)
+      {
+        // concatenate it
+        tmp += *it;
+      }
+    else
+      {
+        // otherwise add a parameter and erase the tmp string
+        if (!tmp.empty ())
+        {
+          result.push_back(tmp);
+          tmp.erase ();
+        }
+      }
+    }
+  // if the there are some remainders of the command add them
+  if (!tmp.empty())
+  {
+    result.push_back(tmp);
+  }
+  // return true if the quotation has been closed
+  return currentQuote == '\0';
+}
+
 //------------------------------------------------------------------------------
 // Execute interactive
 //------------------------------------------------------------------------------
-int ExecuteInteractive( const URL &url )
+int ExecuteInteractive( const URL &url, bool noCwd = false )
 {
   //----------------------------------------------------------------------------
   // Set up the environment
@@ -1642,14 +1754,21 @@ int ExecuteInteractive( const URL &url )
   read_history( historyFile.c_str() );
   FSExecutor *ex = CreateExecutor( url );
 
+  if( noCwd )
+    ex->GetEnv()->PutInt( "NoCWD", 1 );
+
   //----------------------------------------------------------------------------
   // Execute the commands
   //----------------------------------------------------------------------------
+  std::string cmdline;
   while(1)
   {
     char *linebuf = 0;
-    linebuf = readline( BuildPrompt( ex->GetEnv(), url ).c_str() );
-    if( !linebuf || !strcmp( linebuf, "exit" ) || !strcmp( linebuf, "quit" ) )
+    // print new prompt only if the previous line was complete
+    // (a line is considered not to be complete if a quote has
+    // been opened but it has not been closed)
+    linebuf = readline( cmdline.empty() ? BuildPrompt( ex->GetEnv(), url ).c_str() : "> " );
+    if( !linebuf || !strncmp( linebuf, "exit", 4 ) || !strncmp( linebuf, "quit", 4 ) )
     {
       std::cout << "Goodbye." << std::endl << std::endl;
       break;
@@ -1659,11 +1778,17 @@ int ExecuteInteractive( const URL &url )
       free( linebuf );
       continue;
     }
-    XRootDStatus st = ex->Execute( linebuf );
-    add_history( linebuf );
+    std::vector<std::string> args;
+    cmdline += linebuf;
     free( linebuf );
-    if( !st.IsOK() )
-      std::cerr << st.ToStr() << std::endl;
+    if (getArguments( args, cmdline ))
+    {
+      XRootDStatus st = ex->Execute( args );
+      add_history( cmdline.c_str() );
+      cmdline.erase();
+      if( !st.IsOK() )
+        std::cerr << st.ToStr() << std::endl;
+    }
   }
 
   //----------------------------------------------------------------------------
@@ -1690,7 +1815,8 @@ int ExecuteCommand( const URL &url, int argc, char **argv )
   }
 
   FSExecutor *ex = CreateExecutor( url );
-  int st = ExecuteCommand( ex, commandline );
+  ex->GetEnv()->PutInt( "NoCWD", 1 );
+  int st = ExecuteCommand( ex, argc, argv );
   delete ex;
   return st;
 }
@@ -1717,14 +1843,23 @@ int main( int argc, char **argv )
     return 0;
   }
 
-  URL url( argv[1] );
+  bool noCwd = false;
+  int urlIndex = 1;
+  if( !strcmp( argv[1], "--no-cwd") )
+  {
+    ++urlIndex;
+    noCwd = true;
+  }
+
+  URL url( argv[urlIndex] );
   if( !url.IsValid() )
   {
     PrintHelp( 0, 0, params );
     return 1;
   }
 
-  if( argc == 2 )
-    return ExecuteInteractive( url );
-  return ExecuteCommand( url, argc-2, argv+2 );
+  if( argc == urlIndex + 1 )
+    return ExecuteInteractive( url, noCwd );
+  int shift = urlIndex + 1;
+  return ExecuteCommand( url, argc-shift, argv+shift );
 }

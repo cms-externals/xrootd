@@ -88,11 +88,11 @@
 void trim(std::string &str)
 {
   // Trim leading non-letters
-  while(str.size() && !isalnum(str[0])) str.erase(str.begin());
+  while( str.size() && !isgraph(str[0]) ) str.erase(str.begin());
 
   // Trim trailing non-letters
   
-  while(str.size() && !isalnum(str[str.size()-1]))
+  while( str.size() && !isgraph(str[str.size()-1]) )
     str.resize (str.size () - 1);
 
 }
@@ -160,7 +160,7 @@ int XrdHttpReq::parseLine(char *line, int len) {
     char *val = line + pos + 1;
 
     // Trim left
-    while (!isalnum(*val) || (!*val)) val++;
+    while ( (!isgraph(*val) || (!*val)) && (val < line+len)) val++;
 
     // Here we are supposed to initialize whatever flag or variable that is needed
     // by looking at the first token of the line
@@ -494,6 +494,10 @@ int XrdHttpReq::File(XrdXrootd::Bridge::Context &info, //!< the result context
   //prot->SendSimpleResp(200, NULL, NULL, NULL, dlen);
   int rc = info.Send(0, 0, 0, 0);
   TRACE(REQ, " XrdHttpReq::File dlen:" << dlen << " send rc:" << rc);
+  if (rc) return false;
+  writtenbytes += dlen;
+  
+    
   return true;
 };
 
@@ -634,10 +638,19 @@ void XrdHttpReq::appendOpaque(XrdOucString &s, XrdSecEntity *secent, char *hash,
 void XrdHttpReq::parseResource(char *res) {
   // Look for the first '?'
   char *p = strchr(res, '?');
-
+  
   // Not found, then it's just a filename
   if (!p) {
     resource.assign(res, 0);
+    
+    // Sanitize the resource string, removing double slashes
+    int pos = 0;
+    do { 
+      pos = resource.find("//", pos);
+      if (pos != STR_NPOS)
+        resource.erase(pos, 1);
+    } while (pos != STR_NPOS);
+    
     return;
   }
 
@@ -649,7 +662,15 @@ void XrdHttpReq::parseResource(char *res) {
   // Whatever comes after is opaque data to be parsed
   if (strlen(p) > 1)
     opaque = new XrdOucEnv(p + 1);
-
+    
+  // Sanitize the resource string, removing double slashes
+  int pos = 0;
+  do { 
+    pos = resource.find("//", pos);
+    if (pos != STR_NPOS)
+      resource.erase(pos, 1);
+  } while (pos != STR_NPOS);
+  
 }
 
 int XrdHttpReq::ProcessHTTPReq() {
@@ -682,28 +703,63 @@ int XrdHttpReq::ProcessHTTPReq() {
     case XrdHttpReq::rtGET:
     {
 
-      if (prot->embeddedstatic && resource.beginswith("/static/")) {
-        // This is a request for an embedded static resource
-        // The sysadmin can always use the file system if he wants to put his own.
-        // In that case he has to respect the behavior of
-        // the xrootd with the oss.localroot and all.export directives, which is
-        // not very practical.
+        if (resource.beginswith("/static/")) {
 
-        if (resource == "/static/css/xrdhttp.css") {
-          prot->SendSimpleResp(200, NULL, NULL, (char *) static_css_xrdhttp_css, static_css_xrdhttp_css_len);
-          reset();
-          return 1;
-        }
-        if (resource == "/static/icons/xrdhttp.ico") {
-          prot->SendSimpleResp(200, NULL, NULL, (char *) favicon_ico, favicon_ico_len);
-          reset();
-          return 1;
-        }
+            // This is a request for a /static resource
+            // If we have to use the embedded ones then we return the ones in memory as constants
+
+            // The sysadmin can always redirect the request to another host that
+            // contains his static resources
+
+            // We also allow xrootd to preread from the local disk all the files
+            // that have to be served as static resources.
+
+            if (prot->embeddedstatic) {
+
+                // Default case: the icon and the css of the HTML rendering of XrdHttp
+                if (resource == "/static/css/xrdhttp.css") {
+                    prot->SendSimpleResp(200, NULL, NULL, (char *) static_css_xrdhttp_css, static_css_xrdhttp_css_len);
+                    reset();
+                    return 1;
+                  }
+                if (resource == "/static/icons/xrdhttp.ico") {
+                    prot->SendSimpleResp(200, NULL, NULL, (char *) favicon_ico, favicon_ico_len);
+                    reset();
+                    return 1;
+                  }
+
+              }
+
+              // If we are here then none of the embedded resources match (or they are disabled)
+              // We may have to redirect to a host that is supposed to serve the static resources
+              if (prot->staticredir) {
+
+                  XrdOucString s = "Location: ";
+                  s.append(prot->staticredir);
+
+                  if (s.endswith('/'))
+                    s.erasefromend(1);
+
+                  s.append(resource);
+                  appendOpaque(s, 0, 0, 0);
+
+                  prot->SendSimpleResp(302, NULL, (char *) s.c_str(), 0, 0);
+                  return -1;
 
 
-      }
+                } else {
+
+                  // We lookup the requested path in a hash containing the preread files
+                  XrdHttpProtocol::StaticPreloadInfo *mydata = prot->staticpreload->Find(resource.c_str());
+                  if (mydata) {
+                      prot->SendSimpleResp(200, NULL, NULL, (char *) mydata->data, mydata->len);
+                      reset();
+                      return 1;
+                    }
+                }
 
 
+          }
 
       switch (reqstate) {
         case 0: // Stat()
@@ -778,40 +834,78 @@ int XrdHttpReq::ProcessHTTPReq() {
               return -1;
             }
 
+            // Prepare to chunk up the request
+            writtenbytes = 0;
+            
             // We want to be invoked again after this request is finished
             return 0;
           }
 
 
         }
-        case 2: // Read()
+        default: // Read() or Close()
         {
 
+	  if ( ((reqstate == 3) && (rwOps.size() > 1)) ||
+	      (writtenbytes >= filesize) ) {
+	    // Close() if this was a readv or we have finished, otherwise read the next chunk
+ 	  
+	      // --------- CLOSE
+	      memset(&xrdreq, 0, sizeof (ClientRequest));
+	      xrdreq.close.requestid = htons(kXR_close);
+	      memcpy(xrdreq.close.fhandle, fhandle, 4);
+
+	      if (!prot->Bridge->Run((char *) &xrdreq, 0, 0)) {
+		prot->SendSimpleResp(404, NULL, NULL, (char *) "Could not run close request.", 0);
+		return -1;
+	      }
+
+	      // We have finished
+	      return 1;
+
+	  }
+	  
           if (rwOps.size() <= 1) {
             // No chunks or one chunk... Request the whole file or single read
-
-
+	    // 
+	    long l;
             // --------- READ
             memset(&xrdreq, 0, sizeof (xrdreq));
             xrdreq.read.requestid = htons(kXR_read);
             memcpy(xrdreq.read.fhandle, fhandle, 4);
             xrdreq.read.dlen = 0;
-
+	    
             if (rwOps.size() == 0) {
-              xrdreq.read.offset = 0;
-              xrdreq.read.rlen = htonl(filesize);
+	      l = (long)min(filesize-writtenbytes, (long long)1024*1024);
+              xrdreq.read.offset = htonll(writtenbytes);
+              xrdreq.read.rlen = htonl(l);
             } else {
-              xrdreq.read.offset = htonll(rwOps[0].bytestart);
-              xrdreq.read.rlen = htonl(rwOps[0].byteend - rwOps[0].bytestart + 1);
+	      l = min(rwOps[0].byteend - rwOps[0].bytestart + 1 - writtenbytes, (long long)1024*1024);
+              xrdreq.read.offset = htonll(rwOps[0].bytestart + writtenbytes);
+              xrdreq.read.rlen = htonl(l);
             }
 
-            if (prot->ishttps) {
+	    if (prot->ishttps) {
               if (!prot->Bridge->setSF((kXR_char *) fhandle, false)) {
                 TRACE(REQ, " XrdBridge::SetSF(false) failed.");
 
               }
             }
 
+            if (l <= 0) {
+	      if (l < 0) {
+		TRACE(ALL, " Data sizes mismatch.");
+		return -1;
+	      }
+	      else {
+		TRACE(ALL, " No more bytes to send.");
+		reset();
+		return 1;
+	      }
+	    }
+	    
+	    
+	    
             if (!prot->Bridge->Run((char *) &xrdreq, 0, 0)) {
               prot->SendSimpleResp(404, NULL, NULL, (char *) "Could not run read request.", 0);
               return -1;
@@ -831,26 +925,7 @@ int XrdHttpReq::ProcessHTTPReq() {
           // We want to be invoked again after this request is finished
           return 0;
         }
-        case 3: // Close()
-        {
-          // --------- READ
-          memset(&xrdreq, 0, sizeof (ClientRequest));
-          xrdreq.close.requestid = htons(kXR_close);
-          memcpy(xrdreq.close.fhandle, fhandle, 4);
-
-
-          if (!prot->Bridge->Run((char *) &xrdreq, 0, 0)) {
-            prot->SendSimpleResp(404, NULL, NULL, (char *) "Could not run close request.", 0);
-            return -1;
-          }
-
-          // We have finished
-
-          return 1;
-
-        }
-        default:
-          return -1;
+        
       }
 
 
@@ -1369,18 +1444,31 @@ int XrdHttpReq::PostProcessHTTPReq(bool final_) {
           else
             stringresp += prot->Link->ID;
          
+	  if (prot->SecEntity.vorg ||
+	      prot->SecEntity.moninfo ||
+	      prot->SecEntity.role)
+		stringresp += " (";
+		
           if (prot->SecEntity.vorg) {
-            stringresp += " (VO: ";
+            stringresp += " VO: ";
             stringresp += prot->SecEntity.vorg;
-
           }
-
+          
+	  if (prot->SecEntity.moninfo) {
+            stringresp += " DN: ";
+            stringresp += prot->SecEntity.moninfo;
+          }
+          
           if (prot->SecEntity.role) {
             stringresp += " Role: ";
             stringresp += prot->SecEntity.role;
-            stringresp += " )";
           }
  
+ 	  if (prot->SecEntity.vorg ||
+	      prot->SecEntity.moninfo ||
+	      prot->SecEntity.role)
+		stringresp += " )";
+		
           if (prot->SecEntity.host) {
             stringresp += " ( ";
             stringresp += prot->SecEntity.host;
@@ -1448,7 +1536,7 @@ int XrdHttpReq::PostProcessHTTPReq(bool final_) {
 
 
               if (rwOps.size() == 0) {
-                // Full file
+                // Full file.
                 
                 prot->SendSimpleResp(200, NULL, NULL, NULL, filesize);
                 return 0;
@@ -1496,8 +1584,11 @@ int XrdHttpReq::PostProcessHTTPReq(bool final_) {
               return -1;
             }
           }
-          case 2: //read
+          default: //read or readv
           {
+	    // Close() if this was the third state of a readv, otherwise read the next chunk
+	    if ((reqstate == 3) && (ntohs(xrdreq.header.requestid) == kXR_readv)) return 1;
+	    
             // If we are here it's too late to send a proper error message...
             if (xrdresp == kXR_error) return -1;
 
@@ -1524,11 +1615,11 @@ int XrdHttpReq::PostProcessHTTPReq(bool final_) {
                             (char *) "123456");
 
                     TRACEI(REQ, "Sending multipart: " << rwOps[rwOpDone].bytestart << "-" << rwOps[rwOpDone].byteend);
-                    prot->SendData((char *) s.c_str(), s.size());
+                    if (prot->SendData((char *) s.c_str(), s.size())) return -1;
                   }
 
                   // Send all the data we have
-                  prot->SendData(p + sizeof (readahead_list), len);
+                  if (prot->SendData(p + sizeof (readahead_list), len)) return -1;
 
                   // If we sent all the data relative to the current original chunk request
                   // then pass to the next chunk, otherwise wait for more data
@@ -1546,26 +1637,18 @@ int XrdHttpReq::PostProcessHTTPReq(bool final_) {
 
               if (rwOpDone == rwOps.size()) {
                 string s = buildPartialHdrEnd((char *) "123456");
-                prot->SendData((char *) s.c_str(), s.size());
+                if (prot->SendData((char *) s.c_str(), s.size())) return -1;
               }
 
             } else
               for (int i = 0; i < iovN; i++) {
-                prot->SendData((char *) iovP[i].iov_base, iovP[i].iov_len);
+		if (prot->SendData((char *) iovP[i].iov_base, iovP[i].iov_len)) return -1;
+		writtenbytes += iovP[i].iov_len;
               }
-
+              
             return 0;
           }
-          case 3: //close
-          {
-            return 1;
-          }
 
-
-
-
-          default:
-            break;
         }
 
 

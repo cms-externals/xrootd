@@ -26,14 +26,12 @@
 #define __XRD_CL_PLUGIN_MANAGER__
 
 #include "XrdCl/XrdClPlugInInterface.hh"
-#include "XrdSys/XrdSysPlugin.hh"
+#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
 #include <map>
 #include <string>
 #include <utility>
-
-class XrdSysPlugin;
 
 namespace XrdCl
 {
@@ -81,7 +79,7 @@ namespace XrdCl
       //! files located in:
       //!
       //! 1) system directory: /etc/xrootd/client.plugins.d/
-      //! 2) user direvtory:   ~/.xrootd/client.plugins.f/
+      //! 2) user direvtory:   ~/.xrootd/client.plugins.d/
       //! 3) directory pointed to by XRD_PLUGINCONFDIR envvar
       //!
       //! In that order.
@@ -89,16 +87,19 @@ namespace XrdCl
       //! The configuration files contain lines with key-value pairs in the
       //! form of 'key=value'.
       //!
-      //! Possible keys are:
+      //! Mandatory keys are:
       //! url - a semicolon separated list of URLs the plug-in applies to
       //! lib - plugin library to be loaded
+      //! enabled - determines whether the plug-in should be enabled or not
+      //!
+      //! You may use any other keys for your own purposes.
       //!
       //! The config files are processed in alphabetic order, any satteing
       //! found later superseeds the previous one. Any setting applied via
       //! environment or config files superseeds any setting done
       //! programatically.
       //!
-      //! The plug-in library must implement the following method:
+      //! The plug-in library must implement the following C function:
       //!
       //! @code{.cpp}
       //! extern "C"
@@ -110,7 +111,7 @@ namespace XrdCl
       //! }
       //! @endcode
       //!
-      //! where arf is a const pointer to std::map<std::string, std::string>
+      //! where arg is a const pointer to std::map<std::string, std::string>
       //! containing the plug-in configuration.
       //------------------------------------------------------------------------
       void ProcessEnvironmentSettings();
@@ -121,11 +122,16 @@ namespace XrdCl
       struct FactoryHelper
       {
         FactoryHelper(): plugin(0), factory(0), isEnv(false), counter(0) {}
-        ~FactoryHelper() { delete factory; delete plugin; }
-        XrdSysPlugin  *plugin;
-        PlugInFactory *factory;
-        bool           isEnv;
-        uint32_t       counter;
+        ~FactoryHelper()
+        {
+          delete factory;
+          if(plugin) plugin->Unload();
+          delete plugin;
+        }
+        XrdOucPinLoader *plugin;
+        PlugInFactory   *factory;
+        bool             isEnv;
+        uint32_t         counter;
       };
 
       //------------------------------------------------------------------------
@@ -141,7 +147,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Load the plug-in and create the factory
       //------------------------------------------------------------------------
-      std::pair<XrdSysPlugin*,PlugInFactory*> LoadFactory(
+      std::pair<XrdOucPinLoader*,PlugInFactory*> LoadFactory(
         const std::string                        &lib,
         const std::map<std::string, std::string> &config );
 
@@ -152,7 +158,7 @@ namespace XrdCl
       bool RegisterFactory( const std::string &urlString,
                             const std::string &lib,
                             PlugInFactory     *factory,
-                            XrdSysPlugin      *plugin );
+                            XrdOucPinLoader   *plugin );
 
       //------------------------------------------------------------------------
       //! Normalize a URL
@@ -163,6 +169,6 @@ namespace XrdCl
       FactoryHelper                         *pDefaultFactory;
       XrdSysMutex                            pMutex;
   };
-};
+}
 
 #endif // __XRD_CL_PLUGIN_MANAGER__

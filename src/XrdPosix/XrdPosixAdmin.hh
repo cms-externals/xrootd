@@ -57,7 +57,7 @@ XrdCl::URL    *FanOut(int &num);
 int            Query(XrdCl::QueryCode::Code reqCode, void *buff, int bsz);
 
 bool           Stat(mode_t *flags=0, time_t *mtime=0,
-                    size_t *size=0,  ino_t  *id=0);
+                    size_t *size=0,  ino_t  *id=0, dev_t *rdv=0);
 
       XrdPosixAdmin(const char *path)
                       : Url((std::string)path), Xrd(Url) {}

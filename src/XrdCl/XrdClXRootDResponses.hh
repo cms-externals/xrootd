@@ -344,7 +344,8 @@ namespace XrdCl
         POSCPending  = kXR_poscpend,  //!< File opened with POST flag, not yet
                                       //!< successfully closed
         IsReadable   = kXR_readable,  //!< Read access is allowed
-        IsWritable   = kXR_writable   //!< Write access is allowed
+        IsWritable   = kXR_writable,  //!< Write access is allowed
+        BackUpExists = kXR_bkpexist   //!< Back up copy exists
       };
 
       //------------------------------------------------------------------------
@@ -668,7 +669,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void SetParentName( const std::string &parent )
       {
-        pParent = parent;
+        size_t pos = parent.find( '?' );
+        pParent = pos == std::string::npos ? parent : parent.substr( 0, pos );
         if( !pParent.empty() && pParent[pParent.length()-1] != '/' )
           pParent += "/";
       }
@@ -840,7 +842,7 @@ namespace XrdCl
       //! @param status   status of the request
       //! @param response an object associated with the response
       //!                 (request dependent)
-      //! @param urlList  list of hosts the request was redirected to
+      //! @param hostList list of hosts the request was redirected to
       //------------------------------------------------------------------------
       virtual void HandleResponseWithHosts( XRootDStatus *status,
                                             AnyObject    *response,

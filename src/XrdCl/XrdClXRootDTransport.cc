@@ -36,6 +36,9 @@
 #include "XrdOuc/XrdOucErrInfo.hh"
 #include "XrdOuc/XrdOucUtils.hh"
 #include "XrdSys/XrdSysTimer.hh"
+#include "XrdSys/XrdSysPlugin.hh"
+#include "XrdSec/XrdSecLoadSecurity.hh"
+#include "XrdVersion.hh"
 
 #include <arpa/inet.h>
 #include <sys/types.h>
@@ -44,6 +47,8 @@
 #include <sstream>
 #include <iomanip>
 #include <set>
+
+XrdVERSIONINFOREF( XrdCl );
 
 namespace XrdCl
 {
@@ -64,6 +69,7 @@ namespace XrdCl
       LoginSent,
       AuthSent,
       BindSent,
+      EndSessionSent,
       Connected
     };
 
@@ -89,6 +95,7 @@ namespace XrdCl
     XRootDChannelInfo():
       serverFlags(0),
       protocolVersion(0),
+      firstLogIn(true),
       sidManager(0),
       authBuffer(0),
       authProtocol(0),
@@ -99,6 +106,7 @@ namespace XrdCl
     {
       sidManager = new SIDManager();
       memset( sessionId, 0, 16 );
+      memset( oldSessionId, 0, 16 );
     }
 
     //--------------------------------------------------------------------------
@@ -118,6 +126,8 @@ namespace XrdCl
     uint32_t          serverFlags;
     uint32_t          protocolVersion;
     uint8_t           sessionId[16];
+    uint8_t           oldSessionId[16];
+    bool              firstLogIn;
     SIDManager       *sidManager;
     char             *authBuffer;
     XrdSecProtocol   *authProtocol;
@@ -147,8 +157,7 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   XRootDTransport::~XRootDTransport()
   {
-    if( pSecLibHandle )
-      dlclose( pSecLibHandle );
+    delete pSecLibHandle; pSecLibHandle = 0;
   }
 
   //----------------------------------------------------------------------------
@@ -341,7 +350,20 @@ namespace XrdCl
 
       if( st.IsOK() && st.code == suDone )
       {
+        //----------------------------------------------------------------------
+        // If it's not our first log in we need to end the previous session
+        // to make sure that the server noticed our disconnection and closed
+        // all the writable handles that we owned
+        //----------------------------------------------------------------------
+        if( !info->firstLogIn )
+        {
+          handShakeData->out = GenerateEndSession( handShakeData, info );
+          sInfo.status = XRootDStreamInfo::EndSessionSent;
+          return Status( stOK, suContinue );
+        }
+
         sInfo.status = XRootDStreamInfo::Connected;
+        info->firstLogIn = false;
         return st;
       }
 
@@ -361,12 +383,49 @@ namespace XrdCl
       Status st = DoAuthentication( handShakeData, info );
 
       if( !st.IsOK() )
+      {
         sInfo.status = XRootDStreamInfo::Broken;
+        return st;
+      }
 
       if( st.IsOK() && st.code == suDone )
+      {
+        //----------------------------------------------------------------------
+        // If it's not our first log in we need to end the previous session
+        //----------------------------------------------------------------------
+        if( !info->firstLogIn )
+        {
+          handShakeData->out = GenerateEndSession( handShakeData, info );
+          sInfo.status = XRootDStreamInfo::EndSessionSent;
+          return Status( stOK, suContinue );
+        }
+
         sInfo.status = XRootDStreamInfo::Connected;
+        info->firstLogIn = false;
+        return st;
+      }
 
       return st;
+    }
+
+    //--------------------------------------------------------------------------
+    // The last step - kXR_endsess returned
+    //--------------------------------------------------------------------------
+    if( sInfo.status == XRootDStreamInfo::EndSessionSent )
+    {
+      Status st = ProcessEndSessionResp( handShakeData, info );
+
+      if( !st.IsOK() )
+      {
+        sInfo.status = XRootDStreamInfo::Broken;
+        return st;
+      }
+
+      if( st.IsOK() && st.code == suDone )
+      {
+        sInfo.status = XRootDStreamInfo::Connected;
+        return st;
+      }
     }
 
     return Status( stOK, suDone );
@@ -758,6 +817,7 @@ namespace XrdCl
 
     req->header.requestid = htons( req->header.requestid );
     req->header.dlen      = htonl( req->header.dlen );
+    msg->SetIsMarshalled( true );
     return Status();
   }
 
@@ -778,6 +838,7 @@ namespace XrdCl
     Status st = MarshallRequest( msg );
     req->header.requestid = htons( req->header.requestid );
     req->header.dlen      = htonl( req->header.dlen );
+    msg->SetIsMarshalled( false );
     return st;
   }
 
@@ -810,31 +871,51 @@ namespace XrdCl
     // kXR_error
     //--------------------------------------------------------------------------
     else if( m->hdr.status == kXR_error )
+    {
+      if( m->hdr.dlen < 4 )
+        return Status( stError, errInvalidMessage );
       m->body.error.errnum = ntohl( m->body.error.errnum );
+    }
 
     //--------------------------------------------------------------------------
     // kXR_wait
     //--------------------------------------------------------------------------
     else if( m->hdr.status == kXR_wait )
+    {
+      if( m->hdr.dlen < 4 )
+        return Status( stError, errInvalidMessage );
       m->body.wait.seconds = htonl( m->body.wait.seconds );
+    }
 
     //--------------------------------------------------------------------------
     // kXR_redirect
     //--------------------------------------------------------------------------
     else if( m->hdr.status == kXR_redirect )
+    {
+      if( m->hdr.dlen < 4 )
+        return Status( stError, errInvalidMessage );
       m->body.redirect.port = htonl( m->body.redirect.port );
+    }
 
     //--------------------------------------------------------------------------
     // kXR_waitresp
     //--------------------------------------------------------------------------
     else if( m->hdr.status == kXR_waitresp )
+    {
+      if( m->hdr.dlen < 4 )
+        return Status( stError, errInvalidMessage );
       m->body.waitresp.seconds = htonl( m->body.waitresp.seconds );
+    }
 
     //--------------------------------------------------------------------------
     // kXR_attn
     //--------------------------------------------------------------------------
     else if( m->hdr.status == kXR_attn )
+    {
+      if( m->hdr.dlen < 4 )
+        return Status( stError, errInvalidMessage );
       m->body.attn.actnum = htonl( m->body.attn.actnum );
+    }
 
     return Status();
   }
@@ -855,9 +936,12 @@ namespace XrdCl
   void XRootDTransport::LogErrorResponse( const Message &msg )
   {
     Log *log = DefaultEnv::GetLog();
-    ServerResponseBody_Error *err = (ServerResponseBody_Error *)msg.GetBuffer(8);
+    ServerResponse *rsp = (ServerResponse *)msg.GetBuffer();
+    char *errmsg = new char[rsp->hdr.dlen-3]; errmsg[rsp->hdr.dlen-4] = 0;
+    memcpy( errmsg, rsp->body.error.errmsg, rsp->hdr.dlen-4 );
     log->Error( XRootDTransportMsg, "Server responded with an error [%d]: %s",
-                                    err->errnum, err->errmsg );
+                                    rsp->body.error.errnum, errmsg );
+   delete [] errmsg;
   }
 
   //----------------------------------------------------------------------------
@@ -967,7 +1051,23 @@ namespace XrdCl
       log->Error( XRootDTransportMsg, "Message 0x%x, stream [%d, %d] is a "
                   "response that we're no longer interested in (timed out)",
                   msg, rsp->hdr.streamid[0], rsp->hdr.streamid[1] );
-      info->sidManager->ReleaseTimedOut( rsp->hdr.streamid );
+      //------------------------------------------------------------------------
+      // If it is kXR_waitresp there will be another one,
+      // so we don't release the sid yet
+      //------------------------------------------------------------------------
+      if( rsp->hdr.status != kXR_waitresp )
+        info->sidManager->ReleaseTimedOut( rsp->hdr.streamid );
+      //------------------------------------------------------------------------
+      // If it is a successful response to an open request
+      // that timed out, we need to send a close
+      //------------------------------------------------------------------------
+      uint16_t sid; memcpy( &sid, rsp->hdr.streamid, 2 );
+      std::set<uint16_t>::iterator sidIt = info->sentOpens.find( sid );
+      if( sidIt != info->sentOpens.end() )
+      {
+        info->sentOpens.erase( sidIt );
+        if( rsp->hdr.status == kXR_ok ) return RequestClose;
+      }
       delete msg;
       return DigestMsg;
     }
@@ -1232,13 +1332,17 @@ namespace XrdCl
     int timeZone = XrdSysTimer::TimeZone();
     char *hostName = XrdNetUtils::MyHostName();
     std::string countryCode = Utils::FQDNToCC( hostName );
-    free( hostName );
     char *cgiBuffer = new char[1024];
     std::string appName;
+    std::string monInfo;
     env->GetString( "AppName", appName );
-    snprintf( cgiBuffer, 1024, "?xrd.cc=%s&xrd.tz=%d&xrd.appname=%s",
-              countryCode.c_str(), timeZone, appName.c_str() );
+    env->GetString( "MonInfo", monInfo );
+    snprintf( cgiBuffer, 1024,
+              "?xrd.cc=%s&xrd.tz=%d&xrd.appname=%s&xrd.info=%s&"
+              "xrd.hostname=%s", countryCode.c_str(), timeZone,
+              appName.c_str(), monInfo.c_str(), hostName );
     uint16_t cgiLen = strlen( cgiBuffer );
+    free( hostName );
 
     //--------------------------------------------------------------------------
     // Generate the message
@@ -1249,10 +1353,58 @@ namespace XrdCl
     loginReq->requestid = kXR_login;
     loginReq->pid       = ::getpid();
     loginReq->capver[0] = kXR_asyncap | kXR_ver003;
-    loginReq->ability   = kXR_fullurl | kXR_readrdok | kXR_multipr;
     loginReq->role[0]   = kXR_useruser;
     loginReq->dlen      = cgiLen;
+    loginReq->ability   = kXR_fullurl | kXR_readrdok;
 
+    int multiProtocol = 0;
+    env->GetInt( "MultiProtocol", multiProtocol );
+    if(multiProtocol)
+      loginReq->ability |= kXR_multipr;
+
+    //--------------------------------------------------------------------------
+    // Check the IP stacks
+    //--------------------------------------------------------------------------
+    XrdNetUtils::NetProt stacks      = XrdNetUtils::NetConfig();
+    bool                 dualStack   = false;
+    bool                 privateIPv6 = false;
+    bool                 privateIPv4 = false;
+
+    if( (stacks & XrdNetUtils::hasIP64) == XrdNetUtils::hasIP64 )
+    {
+      dualStack = true;
+      loginReq->ability  |= kXR_hasipv64;
+    }
+
+    if( (stacks & XrdNetUtils::hasIPv6) && !(stacks & XrdNetUtils::hasPub6) )
+    {
+      privateIPv6 = true;
+      loginReq->ability |= kXR_onlyprv6;
+    }
+
+    if( (stacks & XrdNetUtils::hasIPv4) && !(stacks & XrdNetUtils::hasPub4) )
+    {
+      privateIPv4 = true;
+      loginReq->ability |= kXR_onlyprv4;
+    }
+
+    // The following code snippet tries to overcome the problem that this host
+    // may still be dual-stacked but we don't know it because one of the
+    // interfaces was not registered in DNS.
+    //
+    if( !dualStack && hsData->serverAddr )
+      {if ( (stacks & XrdNetUtils::hasIPv4
+       &&    hsData->serverAddr->isIPType(XrdNetAddrInfo::IPv6))
+       ||   (stacks & XrdNetUtils::hasIPv6
+       &&    hsData->serverAddr->isIPType(XrdNetAddrInfo::IPv4)))
+          {dualStack = true;
+           loginReq->ability  |= kXR_hasipv64;
+          }
+      }
+
+    //--------------------------------------------------------------------------
+    // Check the username
+    //--------------------------------------------------------------------------
     if( hsData->url->GetUserName().length() )
     {
       ::strncpy( (char*)loginReq->username,
@@ -1271,8 +1423,11 @@ namespace XrdCl
     msg->Append( cgiBuffer, cgiLen, 24 );
 
     log->Debug( XRootDTransportMsg, "[%s] Sending out kXR_login request, "
-                "username: %s, cgi: %s", hsData->streamName.c_str(),
-                loginReq->username, cgiBuffer );
+                "username: %s, cgi: %s, dual-stack: %s, private IPv4: %s, "
+                "private IPv6: %s", hsData->streamName.c_str(),
+                loginReq->username, cgiBuffer, dualStack ? "true" : "false",
+                privateIPv4 ? "true" : "false",
+                privateIPv6 ? "true" : "false" );
 
     delete [] cgiBuffer;
     MarshallRequest( msg );
@@ -1300,10 +1455,15 @@ namespace XrdCl
       return Status( stFatal, errLoginFailed );
     }
 
-    log->Debug( XRootDTransportMsg, "[%s] Logged in",
-                hsData->streamName.c_str() );
+    if( !info->firstLogIn )
+      memcpy( info->oldSessionId, info->sessionId, 16 );
 
     memcpy( info->sessionId, rsp->body.login.sessid, 16 );
+
+    std::string sessId = Utils::Char2Hex( rsp->body.login.sessid, 16 );
+
+    log->Debug( XRootDTransportMsg, "[%s] Logged in, session: %s",
+                hsData->streamName.c_str(), sessId.c_str() );
 
     //--------------------------------------------------------------------------
     // We have an authentication info to process
@@ -1357,7 +1517,7 @@ namespace XrdCl
       URL::ParamsMap::const_iterator it;
       for( it = urlParams.begin(); it != urlParams.end(); ++it )
       {
-        if( it->first.compare( 0, 7, "XrdSec." ) )
+        if( it->first.compare( 0, 4, "xrd." ) )
           continue;
 
         info->authEnv->Put( it->first.c_str(), it->second.c_str() );
@@ -1371,6 +1531,8 @@ namespace XrdCl
       memcpy( pars, info->authBuffer, authBuffLen );
       info->authParams = new XrdSecParameters( pars, authBuffLen );
       sInfo.status = XRootDStreamInfo::AuthSent;
+      delete [] info->authBuffer;
+      info->authBuffer = 0;
 
       //------------------------------------------------------------------------
       // Find a protocol that gives us valid credentials
@@ -1442,16 +1604,16 @@ namespace XrdCl
       //------------------------------------------------------------------------
       else if( rsp->hdr.status == kXR_error )
       {
+        char *errmsg = new char[rsp->hdr.dlen-3]; errmsg[rsp->hdr.dlen-4] = 0;
+        memcpy( errmsg, rsp->body.error.errmsg, rsp->hdr.dlen-4 );
         log->Error( XRootDTransportMsg,
                     "[%s] Authentication with %s failed: %s",
                     hsData->streamName.c_str(), protocolName.c_str(),
-                    rsp->body.error.errmsg );
+                    errmsg );
+        delete [] errmsg;
 
-        if( info->authProtocol )
-        {
-          info->authProtocol->Delete();
-          info->authProtocol = 0;
-        }
+        info->authProtocol->Delete();
+        info->authProtocol = 0;
 
         //----------------------------------------------------------------------
         // Find another protocol that gives us valid credentials
@@ -1519,16 +1681,16 @@ namespace XrdCl
     // Loop over the possible protocols to find one that gives us valid
     // credentials
     //--------------------------------------------------------------------------
-    XrdNetAddr *srvAddr = (XrdNetAddr*)hsData->serverAddr;
+    XrdNetAddrInfo &srvAddrInfo = *const_cast<XrdNetAddr *>(hsData->serverAddr);
     while(1)
     {
       //------------------------------------------------------------------------
       // Get the protocol
       //------------------------------------------------------------------------
       info->authProtocol = (*authHandler)( hsData->url->GetHostName().c_str(),
-                                           *srvAddr,
+                                           srvAddrInfo,
                                            *info->authParams,
-                                           0 );
+                                           &ei );
       if( !info->authProtocol )
       {
         log->Error( XRootDTransportMsg, "[%s] No protocols left to try",
@@ -1582,33 +1744,71 @@ namespace XrdCl
     if( pAuthHandler )
       return pAuthHandler;
 
-    //--------------------------------------------------------------------------
-    // dlopen the library
-    //--------------------------------------------------------------------------
-    std::string libName = "libXrdSec"; libName += LT_MODULE_EXT;
-    pSecLibHandle = ::dlopen( libName.c_str(), RTLD_NOW );
-    if( !pSecLibHandle )
-    {
-      log->Error( XRootDTransportMsg,
-                  "Unable to load the authentication library %s: %s",
-                  libName.c_str(), ::dlerror() );
-      return 0;
-    }
+    char errorBuff[1024];
 
-    //--------------------------------------------------------------------------
-    // Get the authentication function handle
-    //--------------------------------------------------------------------------
-    pAuthHandler = (XrdSecGetProt_t)dlsym( pSecLibHandle, "XrdSecGetProtocol" );
+    pAuthHandler = XrdSecLoadSecFactory( errorBuff, 1024 );
+
     if( !pAuthHandler )
     {
       log->Error( XRootDTransportMsg,
-                  "Unable to get the XrdSecGetProtocol symbol from library "
-                  "%s: %s", libName.c_str(), ::dlerror() );
-      ::dlclose( pSecLibHandle );
-      pSecLibHandle = 0;
+                  "Unable to get the security framework: %s", errorBuff );
       return 0;
     }
     return pAuthHandler;
+  }
+
+  //----------------------------------------------------------------------------
+  // Generate the end session message
+  //----------------------------------------------------------------------------
+  Message *XRootDTransport::GenerateEndSession( HandShakeData     *hsData,
+                                                XRootDChannelInfo *info )
+  {
+    Log *log = DefaultEnv::GetLog();
+
+    //--------------------------------------------------------------------------
+    // Generate the message
+    //--------------------------------------------------------------------------
+    Message *msg = new Message( sizeof(ClientEndsessRequest) );
+    ClientEndsessRequest *endsessReq = (ClientEndsessRequest *)msg->GetBuffer();
+
+    endsessReq->requestid = kXR_endsess;
+    memcpy( endsessReq->sessid, info->oldSessionId, 16 );
+    std::string sessId = Utils::Char2Hex( endsessReq->sessid, 16 );
+
+    log->Debug( XRootDTransportMsg, "[%s] Sending out kXR_endsess for session:"
+                " %s", hsData->streamName.c_str(), sessId.c_str() );
+
+    MarshallRequest( msg );
+    return msg;
+  }
+
+  //----------------------------------------------------------------------------
+  // Process the protocol response
+  //----------------------------------------------------------------------------
+  Status XRootDTransport::ProcessEndSessionResp( HandShakeData     *hsData,
+                                                 XRootDChannelInfo *info )
+  {
+    Log *log = DefaultEnv::GetLog();
+
+    Status st = UnMarshallBody( hsData->in, kXR_endsess );
+    if( !st.IsOK() )
+      return st;
+
+    ServerResponse *rsp = (ServerResponse*)hsData->in->GetBuffer();
+
+    if( rsp->hdr.status == kXR_error )
+    {
+      char *errorMsg = new char[rsp->hdr.dlen-3]; errorMsg[rsp->hdr.dlen-4] = 0;
+      memcpy( errorMsg, rsp->body.error.errmsg, rsp->hdr.dlen-4 );
+      log->Debug( XRootDTransportMsg, "[%s] Got error response to "
+                  "kXR_endsess: %s", hsData->streamName.c_str(),
+                  errorMsg );
+      delete [] errorMsg;
+      // we don't really care if it failed
+      // return Status( stFatal, errLoginFailed );
+    }
+
+    return Status();
   }
 
   //----------------------------------------------------------------------------
@@ -1874,8 +2074,16 @@ namespace XrdCl
           o << "none";
         else
         {
-          if( sreq->options == kXR_refresh )
-            o << "kXR_refresh";
+          if( sreq->options & kXR_refresh )
+            o << "kXR_refresh ";
+          if( sreq->options & kXR_prefname )
+            o << "kXR_prefname ";
+          if( sreq->options & kXR_nowait )
+            o << "kXR_nowait ";
+          if( sreq->options & kXR_force )
+            o << "kXR_force ";
+          if( sreq->options & kXR_compress )
+            o << "kXR_compress ";
         }
         o << ")";
         break;

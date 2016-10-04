@@ -1,15 +1,6 @@
 
 include( XRootDCommon )
 
-if( BUILD_LIBEVENT )
-  include_directories( ${LIBEVENT_INCLUDE_DIR} )
-  set( LIBEVENT_POLLER_FILES
-       XrdClPollerLibEvent.cc
-       XrdClPollerLibEvent.hh )
-else()
-  set( LIBEVENT_POLLER_FILES "" )
-endif()
-
 #-------------------------------------------------------------------------------
 # Shared library version
 #-------------------------------------------------------------------------------
@@ -70,16 +61,17 @@ add_library(
                               XrdClPropertyList.hh
                               XrdClCopyJob.hh
   XrdClFileSystemUtils.cc     XrdClFileSystemUtils.hh
-  ${LIBEVENT_POLLER_FILES}
+  XrdClTPFallBackCopyJob.cc   XrdClTPFallBackCopyJob.hh
+  XrdClMetalinkRedirector.cc  XrdClMetalinkRedirector.hh
+  XrdClRedirectorRegistry.cc  XrdClRedirectorRegistry.hh
 )
 
 target_link_libraries(
   XrdCl
+  XrdXml
   XrdUtils
   pthread
-  dl
-  ${LIBEVENT_LIB}
-  ${LIBEVENTPTHREADS_LIB})
+  dl)
 
 set_target_properties(
   XrdCl
@@ -146,6 +138,7 @@ install(
     XrdClPlugInManager.hh
     XrdClPropertyList.hh
     XrdClFileSystemUtils.hh
+    XrdClLog.hh
   DESTINATION    ${CMAKE_INSTALL_INCLUDEDIR}/xrootd/XrdCl )
 
 install(
@@ -166,4 +159,19 @@ install(
     EXECUTE_PROCESS(
       COMMAND ln -sf xrdcp.1 xrdcopy.1
       WORKING_DIRECTORY \$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_MANDIR}/man1 )"
+)
+
+install(
+  CODE "
+    FOREACH(MANPAGE xrdfs.1 xrdcp.1)
+      MESSAGE( \"-- Processing: \" \$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_MANDIR}/man1/\${MANPAGE} )
+      EXECUTE_PROCESS(
+        COMMAND cat \${MANPAGE}
+        COMMAND sed  -e \"s/__VERSION__/${XROOTD_VERSION}/\"
+        OUTPUT_FILE \${MANPAGE}.new
+        WORKING_DIRECTORY \$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_MANDIR}/man1 )
+      EXECUTE_PROCESS(
+        COMMAND mv -f \${MANPAGE}.new \${MANPAGE}
+        WORKING_DIRECTORY \$ENV{DESTDIR}/${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_MANDIR}/man1 )
+    ENDFOREACH()"
 )

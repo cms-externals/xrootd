@@ -27,19 +27,14 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <stdio.h>
+
 #include "XrdVersion.hh"
 
 #include "XrdOuc/XrdOucEnv.hh"
-#include "XrdSec/XrdSecInterface.hh"
+#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdSfs/XrdSfsInterface.hh"
 #include "XrdSys/XrdSysError.hh"
-#include "XrdSys/XrdSysPlugin.hh"
-
-/******************************************************************************/
-/*              V e r s i o n   I n f o r m a t i o n   L i n k               */
-/******************************************************************************/
-  
-XrdVERSIONINFOREF(XrdgetProtocol);
 
 /******************************************************************************/
 /*                 x r o o t d _ l o a d F i l e s y s t e m                  */
@@ -47,68 +42,43 @@ XrdVERSIONINFOREF(XrdgetProtocol);
 
 XrdSfsFileSystem *XrdXrootdloadFileSystem(XrdSysError *eDest,
                                           XrdSfsFileSystem *prevFS,
-                                          char *fslib, const char *cfn)
+                                          char *fslib, int fsver,
+                                          const char *cfn, XrdOucEnv *envP)
 {
-   XrdSysPlugin ofsLib(eDest,fslib,"fslib",&XrdVERSIONINFOVAR(XrdgetProtocol));
-   XrdSfsFileSystem *(*ep)(XrdSfsFileSystem *, XrdSysLogger *, const char *);
-   XrdSfsFileSystem *FS;
+   static XrdVERSIONINFODEF(myVersion, XrdOfsLoader, XrdVNUMBER, XrdVERSION);
+   XrdOucPinLoader ofsLib(eDest, &myVersion, "fslib", fslib);
+   XrdSfsFileSystem_t  ep;
+   XrdSfsFileSystem2_t ep2;
+   XrdSfsFileSystem *FS = 0;
+   const char *epname = "XrdSfsGetFileSystem";
+   char  epbuff[64];
 
 // Record the library path in the environment
 //
    if (!prevFS) XrdOucEnv::Export("XRDOFSLIB", fslib);
 
-// Get the file system object creator
+// If a different version is to used for initialization, generate the name
 //
-   if (!(ep = (XrdSfsFileSystem *(*)(XrdSfsFileSystem *,XrdSysLogger *,const char *))
-                                    ofsLib.getPlugin("XrdSfsGetFileSystem")))
-       return 0;
-
-// Get the file system object
-//
-   if (!(FS = (*ep)(prevFS, eDest->logger(), cfn)))
-      {eDest->Emsg("Config", "Unable to create file system object via",fslib);
-       return 0;
+   if (fsver)
+      {sprintf(epbuff, "XrdSfsGetFileSystem%d", fsver); // Always fits
+       epname = epbuff;
       }
+
+// Get the file system object creator and the object
+//
+   if (fsver)
+      {if ((ep2 = (XrdSfsFileSystem2_t)ofsLib.Resolve(epname)))
+          FS = (*ep2)(prevFS, eDest->logger(), cfn, envP);
+      } else {
+       if ((ep  = (XrdSfsFileSystem_t )ofsLib.Resolve(epname)))
+          FS = (*ep) (prevFS, eDest->logger(), cfn);
+      }
+
+// Issue message if we could not load it
+//
+   if (!FS) eDest->Emsg("Config","Unable to create file system object via",fslib);
 
 // All done
 //
-   ofsLib.Persist();
    return FS;
-}
-  
-/******************************************************************************/
-/*                   x r o o t d _ l o a d S e c u r i t y                    */
-/******************************************************************************/
-
-XrdSecService *XrdXrootdloadSecurity(XrdSysError *eDest, char *seclib, 
-                                     char *cfn, void **secGetProt)
-{
-   XrdSysPlugin secLib(eDest, seclib, "seclib",
-                       &XrdVERSIONINFOVAR(XrdgetProtocol), 1);
-   XrdSecService *(*ep)(XrdSysLogger *, const char *cfn);
-   XrdSecService *CIA;
-
-// Get the server object creator
-//
-   if (!(ep = (XrdSecService *(*)(XrdSysLogger *, const char *cfn))
-              secLib.getPlugin("XrdSecgetService")))
-       return 0;
-
-// Get the server object
-//
-   if (!(CIA = (*ep)(eDest->logger(), cfn)))
-      {eDest->Emsg("Config", "Unable to create security service object via",seclib);
-       return 0;
-      }
-
-// Get the client object creator (in case we are acting as a client). We return
-// the function pointer as a (void *) to the caller so that it can be passed
-// onward via an environment object.
-//
-   if (!(*secGetProt = (void *)secLib.getPlugin("XrdSecGetProtocol"))) return 0;
-
-// All done
-//
-   secLib.Persist();
-   return CIA;
 }

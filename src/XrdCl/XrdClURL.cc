@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <vector>
 #include <sstream>
+#include <algorithm>
 
 namespace XrdCl
 {
@@ -70,7 +71,7 @@ namespace XrdCl
     if( pos != std::string::npos )
     {
       pProtocol = url.substr( 0, pos );
-      current   = url.substr( pos+3, url.length()-pos-3 );
+      current   = url.substr( pos+3 );
     }
     else if( url[0] == '/' )
     {
@@ -105,7 +106,7 @@ namespace XrdCl
       else
       {
         hostInfo = current.substr( 0, pos );
-        path     = current.substr( pos+1, current.length()-pos );
+        path     = current.substr( pos+1 );
       }
     }
 
@@ -159,7 +160,7 @@ namespace XrdCl
     if( pos != std::string::npos )
     {
       std::string userPass = hostInfo.substr( 0, pos );
-      hostPort = hostInfo.substr( pos+1, hostInfo.length() );
+      hostPort = hostInfo.substr( pos+1 );
       pos = userPass.find( ":" );
 
       //------------------------------------------------------------------------
@@ -168,7 +169,7 @@ namespace XrdCl
       if( pos != std::string::npos )
       {
         pUserName = userPass.substr( 0, pos );
-        pPassword = userPass.substr( pos+1, userPass.length() );
+        pPassword = userPass.substr( pos+1 );
         if( pPassword.empty() )
           return false;
       }
@@ -363,6 +364,21 @@ namespace XrdCl
     if( pProtocol != "file" && pProtocol != "stdio" && pHostName.empty() )
       return false;
     return true;
+  }
+
+  bool URL::IsMetalink() const
+  {
+    Env *env = DefaultEnv::GetEnv();
+    int mlProcessing = DefaultMetalinkProcessing;
+    env->GetInt( "MetalinkProcessing", mlProcessing );
+    if( !mlProcessing ) return false;
+    return PathEndsWith( ".meta4" ) || PathEndsWith( ".metalink" );
+  }
+
+  bool URL::PathEndsWith(const std::string & sufix) const
+  {
+    if (sufix.size() > pPath.size()) return false;
+    return std::equal(sufix.rbegin(), sufix.rend(), pPath.rbegin() );
   }
 
   //----------------------------------------------------------------------------

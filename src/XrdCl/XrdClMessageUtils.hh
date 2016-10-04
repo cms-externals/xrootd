@@ -91,6 +91,9 @@ namespace XrdCl
       }
 
     private:
+      SyncResponseHandler(const SyncResponseHandler &other);
+      SyncResponseHandler &operator = (const SyncResponseHandler &other);
+
       XRootDStatus    *pStatus;
       AnyObject       *pResponse;
       Semaphore       *pSem;
@@ -123,7 +126,7 @@ namespace XrdCl
       hostList(0), chunkList(0), redirectLimit(0) {}
     uint16_t         timeout;
     time_t           expires;
-    const HostInfo   loadBalancer;
+    HostInfo         loadBalancer;
     bool             followRedirects;
     bool             stateful;
     HostList        *hostList;
@@ -167,11 +170,10 @@ namespace XrdCl
             return XRootDStatus( stError, errInternal );
           resp->Get( response );
           resp->Set( (int *)0 );
+          delete resp;
+
           if( !response )
-          {
-            delete resp;
             return XRootDStatus( stError, errInternal );
-          }
         }
 
         return ret;
@@ -180,14 +182,25 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Create a message
       //------------------------------------------------------------------------
-      template<class Type>
+      template<class MsgType, class Request>
       static void CreateRequest( Message  *&msg,
-                                 Type     *&req,
+                                 Request     *&req,
                                  uint32_t  payloadSize = 0 )
       {
-        msg = new Message( sizeof(Type)+payloadSize );
-        req = (Type*)msg->GetBuffer();
+        msg = new MsgType( sizeof(Request)+payloadSize );
+        req = (Request*)msg->GetBuffer();
         msg->Zero();
+      }
+
+      //------------------------------------------------------------------------
+      //! Create a message
+      //------------------------------------------------------------------------
+      template<class Request>
+      static void CreateRequest( Message  *&msg,
+                                 Request     *&req,
+                                 uint32_t  payloadSize = 0 )
+      {
+          CreateRequest<Message>( msg, req, payloadSize );
       }
 
       //------------------------------------------------------------------------

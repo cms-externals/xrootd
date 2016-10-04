@@ -45,6 +45,16 @@ namespace XrdCl
     pStateHandler = new FileStateHandler();
   }
 
+  //----------------------------------------------------------------------------
+  // Constructor
+  //----------------------------------------------------------------------------
+  File::File( VirtRedirect virtRedirect, bool enablePlugIns ):
+    pPlugIn(0),
+    pEnablePlugIns( enablePlugIns )
+  {
+    pStateHandler = new FileStateHandler( virtRedirect == EnableVirtRedirect );
+  }
+
   //------------------------------------------------------------------------
   // Destructor
   //------------------------------------------------------------------------
@@ -57,8 +67,7 @@ namespace XrdCl
     // has been finalized by the linker. So, if we don't have the log object
     // at this point we just give up the hope.
     //--------------------------------------------------------------------------
-    if( DefaultEnv::GetLog() )
-      Close();
+    if ( DefaultEnv::GetLog() && IsOpen() ) {XRootDStatus status = Close();}
     delete pStateHandler;
     delete pPlugIn;
   }

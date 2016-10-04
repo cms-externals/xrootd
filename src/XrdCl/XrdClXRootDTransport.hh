@@ -30,6 +30,8 @@
 #include "XrdSec/XrdSecInterface.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 
+class XrdSysPlugin;
+
 namespace XrdCl
 {
   struct XRootDChannelInfo;
@@ -305,8 +307,19 @@ namespace XrdCl
       //------------------------------------------------------------------------
       // Get the authentication function handle
       //------------------------------------------------------------------------
-
       XrdSecGetProt_t GetAuthHandler();
+
+      //------------------------------------------------------------------------
+      // Generate the end session message
+      //------------------------------------------------------------------------
+      Message *GenerateEndSession( HandShakeData     *hsData,
+                                   XRootDChannelInfo *info );
+
+      //------------------------------------------------------------------------
+      // Process the end session response
+      //------------------------------------------------------------------------
+      Status ProcessEndSessionResp( HandShakeData     *hsData,
+                                    XRootDChannelInfo *info );
 
       //------------------------------------------------------------------------
       // Get a string representation of the server flags
@@ -318,7 +331,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       static std::string FileHandleToStr( const unsigned char handle[4] );
 
-      void            *pSecLibHandle;
+      XrdSysPlugin    *pSecLibHandle;
       XrdSecGetProt_t  pAuthHandler;
   };
 }

@@ -5,6 +5,7 @@
 #-------------------------------------------------------------------------------
 
 RCEXP='^[0-9]+\.[0-9]+\.[0-9]+\-rc.*$'
+CERNEXP='^[0-9]+\.[0-9]+\.[0-9]+\-[0-9]+\.CERN.*$'
 
 #-------------------------------------------------------------------------------
 # Find a program
@@ -132,6 +133,14 @@ if test x`echo $VERSION | egrep $RCEXP` != x; then
   VERSION=`echo $VERSION | sed 's/-rc.*//'`
 fi
 
+#-------------------------------------------------------------------------------
+# Deal with CERN releases
+#-------------------------------------------------------------------------------
+if test x`echo $VERSION | egrep $CERNEXP` != x; then
+  RELEASE=`echo $VERSION | sed 's/.*-//'` 
+  VERSION=`echo $VERSION | sed 's/-.*\.CERN//'`
+fi
+
 VERSION=`echo $VERSION | sed 's/-/./g'`
 echo "[i] RPM compliant version: $VERSION-$RELEASE"
 
@@ -197,7 +206,7 @@ fi
 # Check if we need some other versions
 #-------------------------------------------------------------------------------
 OTHER_VERSIONS=`cat $TEMPDIR/xrootd.spec | \
-    egrep '^Source[0-9]+:[[:space:]]*xrootd-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' |\
+    egrep '^Source[0-9]+:[[:space:]]*xrootd-.*.gz$' |\
     awk  '{ print $2; }'`
 
 for VER in $OTHER_VERSIONS; do

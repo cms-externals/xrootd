@@ -44,6 +44,7 @@ class XrdLink;
 class XrdCmsDrop;
 class XrdCmsNode;
 class XrdCmsSelect;
+class XrdCmsSelector;
 class XrdNetAddr;
 
 namespace XrdCms
@@ -68,6 +69,12 @@ static const int CMS_Lost    = 16;
 static const int CMS_isPeer  = 32;
 static const int CMS_isProxy = 64;
 static const int CMS_noSpace =128;
+static const int CMS_isSuper =256;
+
+static const int CMS_isVers3 =0x01000000;
+
+static const int CMS_notServ =CMS_isMan|CMS_isPeer|CMS_isSuper;
+static const int CMS_hasAlts =CMS_isMan|CMS_isPeer;
 
 // Class passed to Space()
 //
@@ -76,15 +83,16 @@ class SpaceData
 public:
 
 long long Total;    // Total space
+long long TotFr;    // Total space free
 int       wMinF;    // Free space minimum to select wFree node
-int       wFree;    // Free space for nodes providing r/w access
+int       wFree;    // Free space for nodes providing r/w access (largest one)
 int       wNum;     // Number of      nodes providing r/w access
-int       wUtil;    // Average utilization
-int       sFree;    // Free space for nodes providing staging
+int       wUtil;    // Average utilization (largest one)
+int       sFree;    // Free space for nodes providing staging    (largest one)
 int       sNum;     // Number of      nodes providing staging
-int       sUtil;    // Average utilization
+int       sUtil;    // Average utilization (largest one)
 
-          SpaceData() : Total(0), wMinF(0),
+          SpaceData() : Total(0), TotFr(0),wMinF(0),
                         wFree(0), wNum(0), wUtil(0),
                         sFree(0), sNum(0), sUtil(0) {}
          ~SpaceData() {}
@@ -98,6 +106,7 @@ int       sUtil;    // Average utilization
 // This a single-instance global class
 //
 class XrdCmsBaseFR;
+class XrdCmsClustID;
 class XrdCmsSelected;
 class XrdOucTList;
 
@@ -142,11 +151,10 @@ SMask_t         getMask(const char *Cid);
 
 // Extracts out node information. Opts are one or more of CmsLSOpts
 //
-enum            CmsLSOpts {LS_NULL=0, LS_IP4=1, LS_IP6=2, LS_IPO=3,
-                           LS_IDNT=4, LS_All=8, LS_PRV=16};
+enum            CmsLSOpts {LS_NULL=0, LS_IPO=0x0100, LS_IDNT=0x0200,
+                           LS_ANY =0x0400, LS_IFMASK = 0x0f};
 
-XrdCmsSelected *List(SMask_t mask, CmsLSOpts opts,
-                     bool &oksel, bool &noipv4, bool &nonet);
+XrdCmsSelected *List(SMask_t mask, CmsLSOpts opts, bool &oksel);
 
 // Returns the location of a file
 //
@@ -166,6 +174,8 @@ long long       Refs() {return SelWcnt+SelWtot+SelRcnt+SelRtot;}
 
 // Called to remove a node from the cluster
 //
+void            Remove(XrdCmsNode *theNode);
+
 void            Remove(const char *reason, XrdCmsNode *theNode, int immed=0);
 
 // Called to reset the node reference counts for nodes matching smask
@@ -174,10 +184,18 @@ void            ResetRef(SMask_t smask);
 
 // Called to select the best possible node to serve a file (two forms)
 //
+static const int RetryErr = -3;
 int             Select(XrdCmsSelect &Sel);
 
 int             Select(SMask_t pmask, int &port, char *hbuff, int &hlen,
-                       int isrw, int isMulti, int isPvt);
+                       int isrw, int isMulti, int ifWant);
+
+// Manipulate the global selection lock
+//
+void            SLock(bool dolock)
+                     {if (dolock) STMutex.Lock();
+                         else     STMutex.UnLock();
+                     }
 
 // Called to get cluster space (for managers and supervisors only)
 //
@@ -192,29 +210,29 @@ int             Statt(char *bfr, int bln); // Manager
 virtual        ~XrdCmsCluster() {} // This object should never be deleted
 
 private:
-int         Assign(const char *Cid);
-XrdCmsNode *calcDelay(int nump, int numd, int numf, int numo,
-                      int nums, int &delay, const char **reason);
+XrdCmsNode *AddAlt(XrdCmsClustID *cidP, XrdLink *lp, int port, int Status,
+                   int sport, const char *theNID, const char *theIF);
+XrdCmsNode *calcDelay(XrdCmsSelector &selR);
 int         Drop(int sent, int sinst, XrdCmsDrop *djp=0);
-void        Record(char *path, const char *reason);
+void        Record(char *path, const char *reason, bool force=false);
+bool        maxBits(SMask_t mVec, int mbits);
 int         Multiple(SMask_t mVec);
-enum        {eExists, eDups, eROfs, eNoRep, eNoEnt}; // Passed to SelFail
+enum        {eExists, eDups, eROfs, eNoRep, eNoSel, eNoEnt}; // Passed to SelFail
 int         SelFail(XrdCmsSelect &Sel, int rc);
 int         SelNode(XrdCmsSelect &Sel, SMask_t  pmask, SMask_t  amask);
-XrdCmsNode *SelbyCost(SMask_t, int &, int &, const char **, int);
-XrdCmsNode *SelbyLoad(SMask_t, int &, int &, const char **, int);
-XrdCmsNode *SelbyRef (SMask_t, int &, int &, const char **, int);
+XrdCmsNode *SelbyCost(SMask_t, XrdCmsSelector &selR);
+XrdCmsNode *SelbyLoad(SMask_t, XrdCmsSelector &selR);
+XrdCmsNode *SelbyRef (SMask_t, XrdCmsSelector &selR);
 int         SelDFS(XrdCmsSelect &Sel, SMask_t amask,
                    SMask_t &pmask, SMask_t &smask, int isRW);
 void        sendAList(XrdLink *lp);
 void        setAltMan(int snum, XrdLink *lp, int port);
+int         Unreachable(XrdCmsSelect &Sel, bool none);
+int         Unuseable(XrdCmsSelect &Sel);
 
-// Number of IP:Port characters per entry
+// Number of <host>:Port characters per entry was INET6_ADDRSTRLEN+10
 //
-static const  int AltSize = INET6_ADDRSTRLEN+10;
-
-XrdSysMutex   cidMutex;         // Protects to cid list
-XrdOucTList  *cidFirst;         // Cluster ID to cluster number map
+static const  int AltSize = 254; // We may revert to IP address
 
 XrdSysMutex   XXMutex;          // Protects cluster summary state variables
 XrdSysMutex   STMutex;          // Protects all node information  variables

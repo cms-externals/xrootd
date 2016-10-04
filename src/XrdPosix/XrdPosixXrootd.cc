@@ -30,6 +30,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/time.h>
 #include <sys/param.h>
 #include <sys/resource.h>
@@ -63,6 +64,8 @@
 namespace XrdPosixGlobals
 {
 XrdScheduler  *schedP = 0;
+XrdCl::DirListFlags::Flags dlFlag = XrdCl::DirListFlags::None;
+bool           psxDBG = (getenv("XRDPOSIX_DEBUG") != 0);
 };
 
 XrdOucCache   *XrdPosixXrootd::myCache  =  0;
@@ -143,29 +146,38 @@ int XrdPosixXrootd::Close(int fildes)
 {
    XrdCl::XRootDStatus Status;
    XrdPosixFile *fP;
-   int ret;
+   bool ret;
 
    if (!(fP = XrdPosixObject::ReleaseFile(fildes)))
       {errno = EBADF; return -1;}
 
-   if (fP->XCio->ioActive())
-   {
-      if (XrdPosixGlobals::schedP )
-      {
-         XrdPosixGlobals::schedP->Schedule(fP);
+// Close the file if there is no active I/O (possible caching). Delete the
+// object if the close was successful (it might not be).
+//
+   if (!(fP->XCio->ioActive()))
+      {if ((ret = fP->Close(Status))) {delete fP; fP = 0;}
+          else if (XrdPosixGlobals::psxDBG)
+                  {char eBuff[2048];
+                   snprintf(eBuff, sizeof(eBuff), "Posix: %s closing %s\n",
+                            Status.ToString().c_str(), fP->Path());
+                   std::cerr <<eBuff <<std::flush;
+                  }
+      } else ret = true;
+
+// If we still have a handle then we need to do a delayed delete on this
+// object because either the close failed or there is still active I/O
+//
+   if (fP)
+      {if (XrdPosixGlobals::schedP) XrdPosixGlobals::schedP->Schedule(fP);
+          else {pthread_t tid;
+                XrdSysThread::Run(&tid, XrdPosixFile::DelayedDestroy, fP, 0,
+                                        "PosixFileDestroy");
+               }
       }
-      else {
-         pthread_t tid;
-         XrdSysThread::Run(&tid, XrdPosixFile::DelayedDestroy, fP, 0, "PosixFileDestroy");
-      }
-      return 0;
-   }
-   else
-   {
-      ret = fP->Close(Status);
-      delete fP;
-      return (ret ? 0 : XrdPosixMap::Result(Status));
-   }
+
+// Return final result
+//
+   return (ret ? 0 : XrdPosixMap::Result(Status));
 }
 
 /******************************************************************************/
@@ -245,6 +257,7 @@ int     XrdPosixXrootd::Fstat(int fildes, struct stat *buf)
    buf->st_atime  = buf->st_mtime = buf->st_ctime = fp->myMtime;
    buf->st_blocks = buf->st_size/512+1;
    buf->st_ino    = fp->myInode;
+   buf->st_rdev   = fp->myRdev;
    buf->st_mode   = fp->myMode;
 
 // All done
@@ -362,6 +375,12 @@ off_t   XrdPosixXrootd::Lseek(int fildes, off_t offset, int whence)
 int XrdPosixXrootd::Mkdir(const char *path, mode_t mode)
 {
   XrdPosixAdmin admin(path);
+  XrdCl::MkDirFlags::Flags flags;
+
+// Preferentially make the whole path unless told otherwise
+//
+   flags = (mode & S_ISUID ? XrdCl::MkDirFlags::None
+                           : XrdCl::MkDirFlags::MakePath);
 
 // Make sure the admin is OK
 //
@@ -370,7 +389,7 @@ int XrdPosixXrootd::Mkdir(const char *path, mode_t mode)
 // Issue the mkdir
 //
    return XrdPosixMap::Result(admin.Xrd.MkDir(admin.Url.GetPathWithParams(),
-                                              XrdCl::MkDirFlags::None,
+                                              flags,
                                               XrdPosixMap::Mode2Access(mode))
                                              );
 }
@@ -432,8 +451,17 @@ int XrdPosixXrootd::Open(const char *path, int oflags, mode_t mode,
 // If we failed, return the reason
 //
    if (!Status.IsOK())
-      {delete fp;
-       return XrdPosixMap::Result(Status);
+      {XrdPosixMap::Result(Status);
+       int rc = errno;
+       if (XrdPosixGlobals::psxDBG && rc != ENOENT && rc != ELOOP)
+          {char eBuff[2048];
+           snprintf(eBuff, sizeof(eBuff), "%s open %s\n",
+                    Status.ToString().c_str(), fp->Path());
+           std::cerr <<eBuff <<std::flush;
+          }
+       delete fp;
+       errno = rc;
+       return -1;
       }
 
 // Assign a file descriptor to this file
@@ -683,10 +711,11 @@ struct dirent64* XrdPosixXrootd::Readdir64(DIR *dirp)
 int XrdPosixXrootd::Readdir_r(DIR *dirp,   struct dirent    *entry,
                                            struct dirent   **result)
 {
-   dirent64 *dp64;
+   dirent64 *dp64 = 0, d64ent;
    int       rc;
 
-   if ((rc = Readdir64_r(dirp, 0, &dp64)) <= 0) {*result = 0; return rc;}
+   if ((rc = Readdir64_r(dirp, &d64ent, &dp64)) || !dp64)
+      {*result = 0; return rc;}
 
    entry->d_ino    = dp64->d_ino;
 #if !defined(__APPLE__) && !defined(__FreeBSD__)
@@ -709,13 +738,12 @@ int XrdPosixXrootd::Readdir64_r(DIR *dirp, struct dirent64  *entry,
 
 // Find the object
 //
-   if (!(dP = XrdPosixObject::Dir(fildes)))
-      {errno = EBADF; return 0;}
+   if (!(dP = XrdPosixObject::Dir(fildes))) return EBADF;
 
 // Get the next entry
 //
-   if (!(*result = dP->nextEntry(entry))) rc = dP->Status();
-      else rc = 0;
+   if (!(*result = dP->nextEntry(entry))) {rc = dP->Status(); *result = 0;}
+      else {rc = 0; *result = entry;}
 
 // Return the appropriate result
 //
@@ -738,8 +766,13 @@ int XrdPosixXrootd::Rename(const char *oldpath, const char *newpath)
 
 // Issue the rename
 //
-   return XrdPosixMap::Result(admin.Xrd.Mv(admin.Url.GetPathWithParams(),
-                                           newUrl.GetPathWithParams()));
+  std::string urlp    = admin.Url.GetPathWithParams();
+  std::string nurlp   = newUrl.GetPathWithParams();
+  int res = XrdPosixMap::Result(admin.Xrd.Mv(urlp, nurlp));
+  if (!res && myCache)
+     myCache->Rename(urlp.c_str(), nurlp.c_str());
+
+  return res;
 }
 
 /******************************************************************************/
@@ -773,7 +806,12 @@ int XrdPosixXrootd::Rmdir(const char *path)
 
 // Issue the rmdir
 //
-   return XrdPosixMap::Result(admin.Xrd.RmDir(admin.Url.GetPathWithParams()));
+   std::string urlp = admin.Url.GetPathWithParams();
+   int res = XrdPosixMap::Result(admin.Xrd.RmDir(urlp));
+   if (!res && myCache)
+      myCache->Rmdir(urlp.c_str());
+
+   return res;
 }
 
 /******************************************************************************/
@@ -807,13 +845,14 @@ int XrdPosixXrootd::Stat(const char *path, struct stat *buf)
 {
    XrdPosixAdmin admin(path);
    size_t stSize;
+   dev_t  stRdev;
    ino_t  stId;
    time_t stMtime;
    mode_t stFlags;
 
 // Issue the stat and verify that all went well
 //
-   if (!admin.Stat(&stFlags, &stMtime, &stSize, &stId)) return -1;
+   if (!admin.Stat(&stFlags, &stMtime, &stSize, &stId, &stRdev)) return -1;
 
 // Return what little we can
 //
@@ -822,6 +861,7 @@ int XrdPosixXrootd::Stat(const char *path, struct stat *buf)
    buf->st_blocks = stSize/512+1;
    buf->st_atime  = buf->st_mtime = buf->st_ctime = stMtime;
    buf->st_ino    = stId;
+   buf->st_rdev   = stRdev;
    buf->st_mode   = stFlags;
    return 0;
 }
@@ -965,8 +1005,14 @@ int XrdPosixXrootd::Truncate(const char *path, off_t Size)
 
 // Issue the truncate
 //
-   return XrdPosixMap::Result(admin.Xrd.Truncate(admin.Url.GetPathWithParams(),
-                                                 tSize));
+  std::string urlp = admin.Url.GetPathWithParams();
+  int res = XrdPosixMap::Result(admin.Xrd.Truncate(urlp,tSize));
+
+  if (!res && myCache) {
+     myCache->Truncate(urlp.c_str(), tSize);
+  }
+
+  return res;
 }
 
 /******************************************************************************/
@@ -983,7 +1029,12 @@ int XrdPosixXrootd::Unlink(const char *path)
 
 // Issue the UnLink
 //
-   return XrdPosixMap::Result(admin.Xrd.Rm(admin.Url.GetPathWithParams()));
+  std::string urlp = admin.Url.GetPathWithParams();
+  int res = XrdPosixMap::Result(admin.Xrd.Rm(urlp));
+  if (!res && myCache)
+     myCache->Unlink(urlp.c_str());
+
+  return res;
 }
 
 /******************************************************************************/
@@ -1274,10 +1325,21 @@ void XrdPosixXrootd::setDebug(int val, bool doDebug)
 void XrdPosixXrootd::setEnv(const char *kword, int kval)
 {
    XrdCl::Env *env = XrdCl::DefaultEnv::GetEnv();
+   static bool dlfSet = false;
 
-// Set the env value
+// Check for internal envars before setting the external one
 //
-   env->PutInt((std::string)kword, kval);
+        if (!strcmp(kword, "DirlistAll"))
+           {XrdPosixGlobals::dlFlag = (kval ? XrdCl::DirListFlags::Locate
+                                            : XrdCl::DirListFlags::None);
+            dlfSet = true;
+           }
+   else if (!strcmp(kword, "DirlistDflt"))
+           {if (!dlfSet)
+            XrdPosixGlobals::dlFlag = (kval ? XrdCl::DirListFlags::Locate
+                                            : XrdCl::DirListFlags::None);
+           }
+   else env->PutInt((std::string)kword, kval);
 }
   
 /******************************************************************************/

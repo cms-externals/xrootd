@@ -1,7 +1,9 @@
 //------------------------------------------------------------------------------
-// Copyright (c) 2011-2012 by European Organization for Nuclear Research (CERN)
+// Copyright (c) 2011-2014 by European Organization for Nuclear Research (CERN)
 // Author: Lukasz Janyst <ljanyst@cern.ch>
 //------------------------------------------------------------------------------
+// This file is part of the XRootD software suite.
+//
 // XRootD is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Lesser General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -14,6 +16,10 @@
 //
 // You should have received a copy of the GNU Lesser General Public License
 // along with XRootD.  If not, see <http://www.gnu.org/licenses/>.
+//
+// In applying this licence, CERN does not waive the privileges and immunities
+// granted to it by virtue of its status as an Intergovernmental Organization
+// or submit itself to any jurisdiction.
 //------------------------------------------------------------------------------
 
 #ifndef __XRD_CL_LOG_HH__
@@ -27,6 +33,17 @@
 #include "XrdCl/XrdClOptimizers.hh"
 
 #include "XrdSys/XrdSysPthread.hh"
+
+//------------------------------------------------------------------------------
+// C++11 atomics are used to avoid illegal behavior when setting/getting the
+// log level. To minimize costs across all platforms, we use
+// std::memory_order_relaxed; this means threads may reorder SetLogLevel writes
+// and the visibility is relatively undefined. However, we know the stores are
+// at least atomic.
+//------------------------------------------------------------------------------
+#if __cplusplus >= 201103L
+#include <atomic>
+#endif
 
 namespace XrdCl
 {
@@ -76,6 +93,7 @@ namespace XrdCl
   {
     public:
       virtual void Write( const std::string &message );
+      virtual ~LogOutCerr() {}
     private:
       XrdSysMutex pMutex;
   };
@@ -102,7 +120,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Constructor
       //------------------------------------------------------------------------
-      Log(): pLevel( NoMsg ), pTopicMaxLength( 18 )
+      Log(): pLevel( NoMsg ), pTopicMaxLength( 18 ), pPid(0)
       {
         pOutput = new LogOutCerr();
         int maxMask = (int)DumpMsg+1;
@@ -123,7 +141,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void Error( uint64_t topic, const char *format, ... )
       {
-        if( unlikely( pLevel < ErrorMsg ) )
+        if( unlikely( GetLevel() < ErrorMsg ) )
           return;
 
         if( unlikely( (topic & pMask[ErrorMsg]) == 0 ) )
@@ -140,7 +158,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void Warning( uint64_t topic, const char *format, ... )
       {
-        if( unlikely( pLevel < WarningMsg ) )
+        if( unlikely( GetLevel() < WarningMsg ) )
           return;
 
         if( unlikely( (topic & pMask[WarningMsg]) == 0 ) )
@@ -157,7 +175,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void Info( uint64_t topic, const char *format, ... )
       {
-        if( likely( pLevel < InfoMsg ) )
+        if( likely( GetLevel() < InfoMsg ) )
           return;
 
         if( unlikely( (topic & pMask[InfoMsg]) == 0 ) )
@@ -174,7 +192,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void Debug( uint64_t topic, const char *format, ... )
       {
-        if( likely( pLevel < DebugMsg ) )
+        if( likely( GetLevel() < DebugMsg ) )
           return;
 
         if( unlikely( (topic & pMask[DebugMsg]) == 0 ) )
@@ -191,7 +209,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void Dump( uint64_t topic, const char *format, ... )
       {
-        if( likely( pLevel < DumpMsg ) )
+        if( likely( GetLevel() < DumpMsg ) )
           return;
 
         if( unlikely( (topic & pMask[DumpMsg]) == 0 ) )
@@ -218,7 +236,11 @@ namespace XrdCl
       //------------------------------------------------------------------------
       void SetLevel( LogLevel level )
       {
+#if __cplusplus >= 201103L
+        pLevel.store(level, std::memory_order_relaxed);
+#else
         pLevel = level;
+#endif
       }
 
       //------------------------------------------------------------------------
@@ -228,7 +250,7 @@ namespace XrdCl
       {
         LogLevel lvl;
         if( StringToLogLevel( level, lvl ) )
-          pLevel = lvl;
+          SetLevel( lvl );
       }
 
       //------------------------------------------------------------------------
@@ -268,7 +290,20 @@ namespace XrdCl
       //------------------------------------------------------------------------
       LogLevel GetLevel() const
       {
+#if __cplusplus >= 201103L
+        LogLevel lvl = pLevel.load(std::memory_order_relaxed);
+        return lvl;
+#else
         return pLevel;
+#endif
+      }
+
+      //------------------------------------------------------------------------
+      //! Set pid
+      //------------------------------------------------------------------------
+      void SetPid(pid_t pid)
+      {
+        pPid = pid;
       }
 
     private:
@@ -277,11 +312,16 @@ namespace XrdCl
       bool StringToLogLevel( const std::string &strLevel, LogLevel &level );
       std::string TopicToString( uint64_t topic );
 
+#if __cplusplus >= 201103L
+      std::atomic<LogLevel> pLevel;
+#else
       LogLevel    pLevel;
+#endif
       uint64_t    pMask[DumpMsg+1];
       LogOut     *pOutput;
       TopicMap    pTopicMap;
       uint32_t    pTopicMaxLength;
+      pid_t       pPid;
   };
 }
 

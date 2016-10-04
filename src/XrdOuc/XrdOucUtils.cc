@@ -43,6 +43,7 @@
 #include <sys/types.h>
 #endif
 #include "XrdNet/XrdNetUtils.hh"
+#include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucUtils.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysPlatform.hh"
@@ -88,8 +89,11 @@ char *XrdOucUtils::eText(int rc, char *eBuff, int eBlen, int AsIs)
 /*                                  d o I f                                   */
 /******************************************************************************/
   
-// doIf() parses "if [<hostlist>] [<altopt> [&& <altop> [ ... ]]]"
-// altop: [exec <pgmlist> [&& named <namelist>]] | [named <namelist>]
+// doIf() parses "if [<hostlist>] [<conds>]"
+// conds: <cond1> | <cond2> | <cond3>
+// cond1: defined <varlist> [&& <conds>]
+// cond2: exec <pgmlist> [&& <cond3>]
+// cond3: named <namelist>
 
 // Returning 1 if true (i.e., this machine is one of the named hosts in hostlist 
 // and is running one of the programs pgmlist and named by one of the names in 
@@ -102,9 +106,10 @@ int XrdOucUtils::doIf(XrdSysError *eDest, XrdOucStream &Config,
                       const char *what,  const char *hname,
                       const char *nname, const char *pname)
 {
-   static const char *brk[] = {"exec", "named", 0};
+   static const char *brk[] = {"defined", "exec", "named", 0};
+   XrdOucEnv *theEnv = 0;
    char *val;
-   int hostok;
+   int hostok, isDef;
 
 // Make sure that at least one thing appears after the if
 //
@@ -124,6 +129,45 @@ int XrdOucUtils::doIf(XrdSysError *eDest, XrdOucStream &Config,
            // No more directives
            if (!val) return 1;
          } else return 0;
+      }
+
+// Check if this is a defined test
+//
+   while(!strcmp(val, "defined"))
+      {if (!(val = Config.GetWord()) || *val != '?')
+          {if (eDest)
+              eDest->Emsg("Config","'?var' missing after 'defined' in",what);
+              return -1;
+          }
+       // Get environment if we have none
+       //
+          if (!theEnv && (theEnv = Config.SetEnv(0))) Config.SetEnv(theEnv);
+          if (!theEnv && *(val+1) != '~') return 0;
+
+       // Check if any listed variable is defined.
+       //
+       isDef = 0;
+       while(val && *val == '?')
+            {if (*(val+1) == '~' ? getenv(val+2) : theEnv->Get(val+1)) isDef=1;
+             val = Config.GetWord();
+            }
+       if (!val || !isDef) return isDef;
+       if (strcmp(val, "&&"))
+          {if (eDest)
+              eDest->Emsg("Config",val,"is invalid for defined test in",what);
+              return -1;
+          } else {
+           if (!(val = Config.GetWord()))
+              {if (eDest)
+                   eDest->Emsg("Config","missing keyword after '&&' in",what);
+                   return -1;
+              }
+          }
+       if (!is1of(val, brk))
+          {if (eDest)
+              eDest->Emsg("Config",val,"is invalid after '&&' in",what);
+              return -1;
+          }
       }
 
 // Check if we need to compare program names (we are here only if we either
@@ -354,6 +398,47 @@ int XrdOucUtils::is1of(char *val, const char **clist)
    return 0;
 }
 
+/******************************************************************************/
+/*                                  L o g 2                                   */
+/******************************************************************************/
+
+// Based on an algorithm produced by Todd Lehman. However, this one returns 0
+// when passed 0 (which is invalid). The caller must check the validity of
+// the input prior to calling Log2(). Essentially, the algorithm subtracts
+// away progressively smaller squares in the sequence
+// { 0 <= k <= 5: 2^(2^k) } = { 2**32, 2**16, 2**8 2**4 2**2, 2**1 } =
+//                          = { 4294967296, 65536, 256, 16, 4, 2 }
+// and sums the exponents k of the subtracted values. It is generally the
+// fastest way to compute log2 for a wide range of possible input values.
+
+int XrdOucUtils::Log2(unsigned long long n)
+{
+  int i = 0;
+
+  #define SHFT(k) if (n >= (1ULL << k)) { i += k; n >>= k; }
+
+  SHFT(32); SHFT(16); SHFT(8); SHFT(4); SHFT(2); SHFT(1); return i;
+
+  #undef SHFT
+}
+  
+/******************************************************************************/
+/*                                 L o g 1 0                                  */
+/******************************************************************************/
+
+int XrdOucUtils::Log10(unsigned long long n)
+{
+  int i = 0;
+
+  #define SHFT(k, m) if (n >= m) { i += k; n /= m; }
+
+  SHFT(16,10000000000000000ULL); SHFT(8,100000000ULL); 
+  SHFT(4,10000ULL);              SHFT(2,100ULL);       SHFT(1,10ULL);
+  return i;
+
+  #undef SHFT
+}
+  
 /******************************************************************************/
 /*                              m a k e H o m e                               */
 /******************************************************************************/

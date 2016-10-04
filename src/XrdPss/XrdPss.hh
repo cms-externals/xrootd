@@ -37,6 +37,7 @@
 #include "XrdOuc/XrdOucExport.hh"
 #include "XrdOuc/XrdOucName2Name.hh"
 #include "XrdOuc/XrdOucPList.hh"
+#include "XrdOuc/XrdOucSid.hh"
 #include "XrdOss/XrdOss.hh"
 
 /******************************************************************************/
@@ -51,13 +52,11 @@ int     Opendir(const char *, XrdOucEnv &);
 int     Readdir(char *buff, int blen);
 
         // Constructor and destructor
-        XrdPssDir(const char *tid) : tident(tid), dirVec(0) {}
-       ~XrdPssDir() {if (dirVec) Close();}
+        XrdPssDir(const char *tid) : tident(tid), myDir(0) {}
+       ~XrdPssDir() {if (myDir) Close();}
 private:
 const    char      *tident;
-         char     **dirVec;
-         int        curEnt;
-         int        numEnt;
+         DIR       *myDir;
 };
   
 /******************************************************************************/
@@ -106,6 +105,7 @@ const char *tident;
 /*                             X r d P s s S y s                              */
 /******************************************************************************/
   
+class XrdNetSecurity;
 class XrdOucEnv;
 class XrdSysError;
 class XrdOucStream;
@@ -137,6 +137,17 @@ int       Stat(const char *, struct stat *, int opts=0, XrdOucEnv *eP=0);
 int       Truncate(const char *, unsigned long long, XrdOucEnv *eP=0);
 int       Unlink(const char *, int Opts=0, XrdOucEnv *eP=0);
 
+static const int    PolNum = 2;
+enum   PolAct {PolPath = 0, PolObj = 1};
+
+static
+const  char *P2CGI(int &cgilen, char *cbuff, int cblen,
+                   const char *Cgi1, const char *Cgi2);
+static int   P2DST(int &retc, char *hBuff, int hBlen, PolAct pType,
+                   const char *path);
+static char *P2ID (XrdOucSid::theSid *idVal, char *idBuff, int idBsz);
+static char *P2OUT(int &retc,  char *pbuff, int pblen,
+                   const char *path, const char *Cgi, const char *Ident);
 static char *P2URL(int &retc, char *pbuff, int pblen,
                    const char *path,       int Split=0,
                    const char *Cgi=0,      int CgiLn=0,
@@ -151,14 +162,19 @@ static gid_t        myGid;
 static
 XrdOucPListAnchor   XPList;        // Exported path list
 
+static XrdNetSecurity *Police[PolNum];
 static XrdOucTList *ManList;
 static const char  *urlPlain;
 static int          urlPlen;
 static int          hdrLen;
 static const char  *hdrData;
 static const char  *urlRdr;
+static int          Streams;
 static int          Workers;
 static int          Trace;
+
+static bool         outProxy; // True means outgoing proxy
+static bool         pfxProxy; // True means outgoing proxy is prefixed
 
 static char         allChmod;
 static char         allMkdir;
@@ -190,6 +206,8 @@ int    ConfigProc(const char *ConfigFN);
 int    ConfigXeq(char*, XrdOucStream&);
 int    ConfigN2N();
 int    getCache();
+const
+char  *getDomain(const char *hName);
 int    xcach(XrdSysError *Eroute, XrdOucStream &Config);
 int    xcacl(XrdSysError *Eroute, XrdOucStream &Config);
 char  *xcapr(XrdSysError *Eroute, XrdOucStream &Config, char *pBuff);
@@ -197,6 +215,7 @@ int    xconf(XrdSysError *Eroute, XrdOucStream &Config);
 int    xdef( XrdSysError *Eroute, XrdOucStream &Config);
 int    xexp( XrdSysError *Eroute, XrdOucStream &Config);
 int    xinet(XrdSysError *errp,   XrdOucStream &Config);
+int    xperm(XrdSysError *errp,   XrdOucStream &Config);
 int    xorig(XrdSysError *errp,   XrdOucStream &Config);
 int    xsopt(XrdSysError *Eroute, XrdOucStream &Config);
 int    xtrac(XrdSysError *Eroute, XrdOucStream &Config);

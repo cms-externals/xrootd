@@ -26,7 +26,9 @@
 #include "XrdFileCacheInfo.hh"
 #include "XrdFileCacheStats.hh"
 
+class XrdJob;
 class XrdOucIOVec;
+
 namespace XrdCl
 {
    class Log;
@@ -82,6 +84,12 @@ namespace XrdFileCache
          //----------------------------------------------------------------------
          bool InitiateClose();
 
+         //----------------------------------------------------------------------
+         //! Sync file cache inf o and output data with disk
+         //----------------------------------------------------------------------
+         void Sync();
+
+
       protected:
          //! Read from disk, RAM, task, or client.
          ssize_t Read(char * buff, off_t offset, size_t size);
@@ -99,12 +107,11 @@ namespace XrdFileCache
          struct Task
          {
             int            ramBlockIdx;  //!< idx in the in-memory buffer
-            size_t         size;         //!< cached, used for the end file block
             XrdSysCondVar *condVar;      //!< signal when complete
 
-            Task(): ramBlockIdx(-1), size(0), condVar(0) {}
-            Task(int r, size_t s, XrdSysCondVar *cv):
-                ramBlockIdx(r), size(s), condVar(cv) {}
+            Task(): ramBlockIdx(-1),  condVar(0) {}
+            Task(int r, XrdSysCondVar *cv):
+                ramBlockIdx(r), condVar(cv) {}
            ~Task() {}
          };
 
@@ -138,9 +145,6 @@ namespace XrdFileCache
          //! Open file handle for data file and info file on local disk.
          bool Open();
 
-         //! Write download state into cinfo file.
-         void RecordDownloadInfo();
-
          //! Short log alias.
          XrdCl::Log* clLog() const { return XrdCl::DefaultEnv::GetLog(); }
 
@@ -156,6 +160,9 @@ namespace XrdFileCache
          //! Read from client into in memory cache, queue ram buffer for disk write.
          void    DoTask(Task* task);
 
+         //! Log path
+         const char* lPath() const;
+          
          RAM             m_ram;            //!< in memory cache
 
          XrdOssDF       *m_output;         //!< file handle for data file on disk
@@ -164,8 +171,9 @@ namespace XrdFileCache
          XrdOucCacheIO  &m_input;          //!< original data source
 
          std::string     m_temp_filename;  //!< filename of data file on disk
-         long long       m_offset;         //!< offset of cached file for block-based operation
-         long long       m_fileSize;       //!< size of cached disk file for block-based operation
+
+         long long       m_offset;         //!< offset of disk file for block-based operation
+         long long       m_fileSize;       //!< size of disk file for block-based operation
 
          bool            m_started;   //!< state of run thread
          bool            m_failed;    //!< reading from original source or writing to disk has failed
@@ -173,12 +181,19 @@ namespace XrdFileCache
          bool            m_stopped;   //!< prefetch is stopped
          XrdSysCondVar   m_stateCond; //!< state condition variable
 
-         XrdSysMutex      m_downloadStatusMutex; //!< mutex locking access to m_cfi object
+         XrdSysMutex       m_downloadStatusMutex; //!< mutex locking access to m_cfi object
 
          std::deque<Task*> m_tasks_queue;  //!< download queue
          XrdSysCondVar     m_queueCond;    //!< m_tasks_queue condition variable
 
-         Stats            m_stats;      //!< cache statistics, used in IO detach
+         Stats             m_stats;      //!< cache statistics, used in IO detach
+
+         // fsync
+         XrdSysMutex       m_syncStatusMutex; //!< mutex locking fsync status
+         XrdJob           *m_syncer;
+         std::vector<int>  m_writes_during_sync;
+         int               m_non_flushed_cnt;
+         bool              m_in_sync;
    };
 }
 #endif

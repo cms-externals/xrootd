@@ -46,13 +46,13 @@
 
 #include "XrdNet/XrdNetAddr.hh"
 #include "XrdNet/XrdNetUtils.hh"
+#include "XrdNet/XrdNetSecurity.hh"
 
 #include "XrdPss/XrdPss.hh"
 
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysPlatform.hh"
-#include "XrdSys/XrdSysPlugin.hh"
 #include "XrdSys/XrdSysPthread.hh"
 
 #include "XrdOuc/XrdOuca2x.hh"
@@ -60,6 +60,7 @@
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucExport.hh"
 #include "XrdOuc/XrdOucN2NLoader.hh"
+#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucTList.hh"
 #include "XrdOuc/XrdOucUtils.hh"
@@ -76,7 +77,7 @@
 
 #define TS_Xeq(x,m)    if (!strcmp(x,var)) return m(&eDest, Config);
 
-/******************************************************************************/
+/*******x**********************************************************************/
 /*                               G l o b a l s                                */
 /******************************************************************************/
 
@@ -88,12 +89,15 @@ gid_t        XrdPssSys::myGid     =  getegid();
 
 XrdOucPListAnchor XrdPssSys::XPList;
 
+XrdNetSecurity   *XrdPssSys::Police[XrdPssSys::PolNum] = {0, 0};
+
 XrdOucTList *XrdPssSys::ManList   =  0;
 const char  *XrdPssSys::urlPlain  =  0;
 int          XrdPssSys::urlPlen   =  0;
 int          XrdPssSys::hdrLen    =  0;
 const char  *XrdPssSys::hdrData   =  0;
 const char  *XrdPssSys::urlRdr    =  0;
+int          XrdPssSys::Streams   =512;
 int          XrdPssSys::Workers   = 16;
 
 char         XrdPssSys::allChmod  =  0;
@@ -105,11 +109,16 @@ char         XrdPssSys::allTrunc  =  0;
 
 char         XrdPssSys::cfgDone   =  0;
 
+bool         XrdPssSys::outProxy  = false;
+bool         XrdPssSys::pfxProxy  = false;
+
 namespace XrdProxy
 {
 static XrdPosixXrootd  *Xroot;
   
 extern XrdSysError      eDest;
+
+extern XrdOucSid       *sidP;
 
 static const int maxHLen = 1024;
 }
@@ -162,9 +171,11 @@ int XrdPssSys::Configure(const char *cfn)
                                                  {0,     0        }
                                                 };
    const char *xP;
+   XrdOucPList *fP;
    pthread_t tid;
    char *eP, theRdr[maxHLen+1024];
    int i, hpLen, NoGo = 0;
+   bool haveFwd = false;
 
 // Get environmental values
 //
@@ -181,24 +192,60 @@ int XrdPssSys::Configure(const char *cfn)
 //
    if (XrdNetAddr::IPV4Set()) XrdPosixXrootd::setIPV4(true);
 
+// Set default number of event loops
+//
+   XrdPosixXrootd::setEnv("ParallelEvtLoop", 3);
+
 // Process the configuration file
 //
    if ((NoGo = ConfigProc(cfn))) return NoGo;
 
-// Build the URL header
+// Make sure we have some kind of origin
 //
-   if (!ManList)
+   if (!ManList && !outProxy)
       {eDest.Emsg("Config", "Origin for proxy service not specified.");
        return 1;
       }
-   if (!(hpLen = buildHdr())) return 1;
 
-// Copy out the forwarding that might be happening via the ofs
+// Tell xrootd to disable async I/O as it just will slow everything down.
 //
-   i = 0;
-   if ((eP = getenv("XRDOFS_FWD")))
-      while(Fwd[i].Typ)
-           {if (!strstr(eP, Fwd[i].Typ)) *(Fwd[i].Loc) = 1; i++;}
+   XrdOucEnv::Export("XRDXROOTD_NOAIO", "1");
+
+// Thell xrootd to disable POSC mode as this is meaningless here
+//
+   XrdOucEnv::Export("XRDXROOTD_NOPOSC", "1");
+
+// Initialize an alternate cache if one is present
+//
+   if (cPath && !getCache()) return 1;
+
+// Allocate an Xroot proxy object (only one needed here). Tell it to not
+// shadow open files with real file descriptors (we will be honest). This can
+// be done before we initialize the ffs.
+//
+   Xroot = new XrdPosixXrootd(-32768, 16384);
+
+// Allocate an streaim ID object if need be
+//
+   if (Streams) sidP = new XrdOucSid((Streams > 8192 ? 8192 : Streams));
+
+// If this is an outgoing proxy then we are done
+//
+   if (outProxy)
+      {if (!ManList) strcpy(theRdr, "=");
+          else sprintf(theRdr, "= %s:%d", ManList->text, ManList->val);
+       XrdOucEnv::Export("XRDXROOTD_PROXY", theRdr);
+       if (ManList)
+          {hdrLen = sprintf(theRdr, "root://%%s%s:%d/%%s%%s%%s",
+                            ManList->text, ManList->val);
+           hdrData = strdup(theRdr);
+          }
+       return 0;
+      }
+
+// Build the URL header
+//
+   if (!(hpLen = buildHdr())) return 1;
 
 // Create a plain url for future use
 //
@@ -210,6 +257,15 @@ int XrdPssSys::Configure(const char *cfn)
    theRdr[urlPlen-1] = 0;
    XrdOucEnv::Export("XRDXROOTD_PROXY", theRdr+hpLen);
    theRdr[urlPlen-1] = '/';
+
+// Copy out the forwarding that might be happening via the ofs
+//
+   i = 0;
+   if ((eP = getenv("XRDOFS_FWD")))
+      while(Fwd[i].Typ)
+           {if (!strstr(eP, Fwd[i].Typ)) {*(Fwd[i].Loc) = 1; haveFwd = true;}
+            i++;
+           }
 
 // Configure the N2N library:
 //
@@ -227,19 +283,16 @@ int XrdPssSys::Configure(const char *cfn)
 //
    strcpy(&theRdr[urlPlen], xP); urlRdr = strdup(theRdr);
 
-// Tell xrootd to disable async I/O as it just will slow everything down.
+// Check if we have any r/w exports as this will determine whether or not we
+// need to initialize the ffs (we'd rather ot if at all possible).
 //
-   XrdOucEnv::Export("XRDXROOTD_NOAIO", "1");
+   fP = XPList.First();
+   while(fP && !(fP->Flag() & XRDEXP_NOTRW)) fP = fP->Next();
 
-// Initialize an alternate cache if one is present
+// We avoid initializing the ffs if we have no r/w paths or there is no need to
+// forward r/w metadata operations (e.g. rm, rmdir, etc).
 //
-   if (cPath && !getCache()) return 1;
-
-// Allocate an Xroot proxy object (only one needed here). Tell it to not
-// shadow open files with real file descriptors (we will be honest). This can
-// be done before we initialize the ffs.
-//
-   Xroot = new XrdPosixXrootd(-32768, 16384);
+   if (!fP || !haveFwd) return 0;
 
 // Now spwan a thread to complete ffs initialization which may hang for a while
 //
@@ -374,6 +427,7 @@ int XrdPssSys::ConfigXeq(char *var, XrdOucStream &Config)
    TS_Xeq("config",        xconf);
    TS_Xeq("inetmode",      xinet);
    TS_Xeq("origin",        xorig);
+   TS_Xeq("permit",        xperm);
    TS_Xeq("setopt",        xsopt);
    TS_Xeq("trace",         xtrac);
    TS_Xeq("namelib",       xnml);
@@ -406,22 +460,34 @@ int XrdPssSys::ConfigXeq(char *var, XrdOucStream &Config)
 
 int XrdPssSys::getCache()
 {
-   XrdSysPlugin     myLib(&eDest, cPath, "cachelib", myVersion);
+   XrdOucPinLoader  myLib(&eDest,myVersion,"cachelib",cPath);
    XrdOucCache     *(*ep)(XrdSysLogger *, const char *, const char *);
    XrdOucCache     *theCache;
 
 // Now get the entry point of the object creator
 //
    ep = (XrdOucCache *(*)(XrdSysLogger *, const char *, const char *))
-                    (myLib.getPlugin("XrdOucGetCache"));
+                    (myLib.Resolve("XrdOucGetCache"));
    if (!ep) return 0;
 
 // Get the Object now
 //
    theCache = ep(eDest.logger(), ConfigFN, cParm);
-   if (theCache) {XrdPosixXrootd::setCache(theCache); myLib.Persist();}
+   if (theCache) {XrdPosixXrootd::setCache(theCache);}
       else eDest.Emsg("Config", "Unable to get cache object from", cPath);
    return theCache != 0;
+}
+  
+/******************************************************************************/
+/*                             g e t D o m a i n                              */
+/******************************************************************************/
+
+const char *XrdPssSys::getDomain(const char *hName)
+{
+   const char *dot = index(hName, '.');
+
+   if (dot) return dot+1;
+   return hName;
 }
   
 /******************************************************************************/
@@ -527,7 +593,7 @@ do{for (i = 0; i < numopts; i++) if (!strcmp(szopts[i].Key, val)) break;
 
 /* Function: xcacl
 
-   Purpose:  To parse the directive: cachelib <path> [<parms>]
+   Purpose:  To parse the directive: cachelib {<path>|default} [<parms>]
 
              <path>    the path of the cache library to be used.
              <parms>   optional parms to be passed
@@ -547,7 +613,7 @@ int XrdPssSys::xcacl(XrdSysError *Eroute, XrdOucStream &Config)
 // Save the path
 //
    if (cPath) free(cPath);
-   cPath = strdup(val);
+   cPath = (strcmp(val,"default") ? strdup(val) : strdup("libXrdFileCache.so"));
 
 // Get the parameters
 //
@@ -634,7 +700,8 @@ int XrdPssSys::xconf(XrdSysError *Eroute, XrdOucStream &Config)
    char  *val, *kvp;
    int    kval;
    struct Xtab {const char *Key; int *Val;} Xopts[] =
-               {{"workers", &Workers}};
+               {{"streams", &Streams},
+                {"workers", &Workers}};
    int i, numopts = sizeof(Xopts)/sizeof(struct Xtab);
 
    if (!(val = Config.GetWord()))
@@ -784,7 +851,9 @@ int XrdPssSys::xnml(XrdSysError *Eroute, XrdOucStream &Config)
 
 /* Function: xorig
 
-   Purpose:  Parse: origin <host>[+][:<port>|<port>]
+   Purpose:  Parse: origin {= [<dest>] | <dest>}
+
+   Where:    <dest> <host>[+][:<port>|<port>]
 
    Output: 0 upon success or !0 upon failure.
 */
@@ -793,13 +862,21 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
 {
     XrdOucTList *tp = 0;
     char *val, *mval = 0;
-    int  i, port;
+    int  i, port = 0;
 
 //  We are looking for regular managers. These are our points of contact
 //
     if (!(val = Config.GetWord()))
        {errp->Emsg("Config","origin host name not specified"); return 1;}
-       else mval = strdup(val);
+
+// Check for outgoing proxy
+//
+   if (!strcmp(val, "="))
+      {pfxProxy = outProxy = true;
+       if (!(val = Config.GetWord())) return 0;
+      }
+      else pfxProxy = outProxy = false;
+   mval = strdup(val);
 
 // Check if there is a port number. This could be as ':port' or ' port'.
 //
@@ -827,12 +904,23 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
 //
     if ((i = strlen(mval)) > 1 && mval[i-1] == '+') mval[i-1] = 0;
 
-// Check if this is a duplicate, if its new, add to the list
+// We used to support multiple destinations in the URL but the new client
+// does not support this. So, we only provide a single destination here. The
+// original code is left commented out just in case we actually revert to this.
 //
-   tp = ManList;
-   while(tp && (strcmp(tp->text, mval) || tp->val != port)) tp = tp->next;
-   if (tp) errp->Emsg("Config","Duplicate origin",mval);
-      else ManList = new XrdOucTList(mval, port, ManList);
+// tp = ManList;
+// while(tp && (strcmp(tp->text, mval) || tp->val != port)) tp = tp->next;
+// if (tp) errp->Emsg("Config","Duplicate origin",mval);
+//    else ManList = new XrdOucTList(mval, port, ManList);
+
+   if (ManList) delete ManList;
+   ManList = new XrdOucTList(mval, port);
+
+// We now set the default dirlist flag based on whether the origin is in or out
+// of domain. Composite listings are normally disabled for out of domain nodes.
+//
+   if (!index(mval, '.') || !strcmp(getDomain(mval), getDomain(myHost)))
+      XrdPosixXrootd::setEnv("DirlistDflt", 1);
 
 // All done
 //
@@ -840,6 +928,45 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
    return tp != 0;
 }
   
+/******************************************************************************/
+/*                                 x p e r m                                  */
+/******************************************************************************/
+
+/* Function: xperm
+
+   Purpose:  To parse the directive: permit [/] [*] <name>
+
+                    netgroup name the host must be a member of. For DNS names,
+                    A single asterisk may be specified anywhere in the name.
+
+   Output: 0 upon success or !0 upon failure.
+*/
+
+int XrdPssSys::xperm(XrdSysError *Eroute, XrdOucStream &Config)
+{   char *val;
+    bool pType[PolNum] = {false, false};
+    int i;
+
+do {if (!(val = Config.GetWord()))
+       {Eroute->Emsg("Config", "permit target not specified"); return 1;}
+         if (!strcmp(val, "/")) pType[PolPath] = true;
+    else if (!strcmp(val, "*")) pType[PolObj ] = true;
+    else break;
+   } while(1);
+
+    if (!pType[PolPath] && !pType[PolObj])
+       pType[PolPath] = pType[PolObj] = true;
+
+    for (i = 0; i < PolNum; i++)
+        {if (pType[i])
+            {if (!Police[i]) Police[i] = new XrdNetSecurity();
+                             Police[i]->AddHost(val);
+            }
+        }
+
+    return 0;
+}
+
 /******************************************************************************/
 /*                                 x s o p t                                  */
 /******************************************************************************/
@@ -856,29 +983,36 @@ int XrdPssSys::xorig(XrdSysError *errp, XrdOucStream &Config)
 
 int XrdPssSys::xsopt(XrdSysError *Eroute, XrdOucStream &Config)
 {
-    char  kword[256], *val, *kvp;
-    long  kval;
-    static struct {const char *Sopt; const char *Copt;} Sopts[]  =
+    char  kword[256], *val;
+    int   kval, noGo;
+    static struct {const char *Sopt; const char *Copt; int isT;} Sopts[]  =
        {
-         {"ConnectTimeout",             "ConnectionWindow"},    // Default  120
-         {"DataServerConn_ttl",         ""},
-         {"DebugLevel",                 "*"},                   // Default   -1
-         {"DfltTcpWindowSize",          0},
-         {"LBServerConn_ttl",           ""},
-         {"ParStreamsPerPhyConn",       "SubStreamsPerChannel"},// Default    1
-         {"ReadAheadSize",              0},
-         {"ReadAheadStrategy",          0},
-         {"ReadCacheBlkRemPolicy",      0},
-         {"ReadCacheSize",              0},
-         {"ReadTrimBlockSize",          0},
-         {"ReconnectWait",              "StreamErrorWindow"},   // Default 1800
-         {"RedirCntTimeout",            "!use RedirectLimit instead."},
-         {"RedirectLimit",              "RedirectLimit"},       // Default   16
-         {"RedirectorConn_ttl",         ""},
-         {"RemoveUsedCacheBlocks",      0},
-         {"RequestTimeout",             "RequestTimeout"},      // Default  300
-         {"TransactionTimeout",         ""},
-         {"WorkerThreads",              "WorkerThreads"}        // Set To    32
+         {"ConnectTimeout",        "ConnectionWindow",1},    // Default  120
+         {"ConnectionRetry",       "ConnectionRetry",1},     // Default    5
+         {"DataServerTTL",         "DataServerTTL",1},       // Default  300
+         {"DataServerConn_ttl",    "DataServerTTL",1},       // Default  300
+         {"DebugLevel",            "*",0},                   // Default   -1
+         {"DebugMask",             "*",0},                   // Default   -1
+         {"DirlistAll",            "DirlistAll",0},
+         {"DataServerTTL",         "DataServerTTL",1},       // Default  300
+         {"LBServerConn_ttl",      "LoadBalancerTTL",1},     // Default 1200
+         {"LoadBalancerTTL",       "LoadBalancerTTL",1},     // Default 1200
+         {"ParallelEvtLoop",       "ParallelEvtLoop",0},     // Default    3
+         {"ParStreamsPerPhyConn",  "SubStreamsPerChannel",0},// Default    1
+         {"ReadAheadSize",         0,0},
+         {"ReadAheadStrategy",     0,0},
+         {"ReadCacheBlkRemPolicy", 0,0},
+         {"ReadCacheSize",         0,0},
+         {"ReadTrimBlockSize",     0,0},
+         {"ReconnectWait",         "StreamErrorWindow",1},   // Default 1800
+         {"RedirCntTimeout",       "!use RedirectLimit instead.",0},
+         {"RedirectLimit",         "RedirectLimit",0},       // Default   16
+         {"RedirectorConn_ttl",    "LoadBalancerTTL",1},     // Default 1200
+         {"RemoveUsedCacheBlocks", 0,0},
+         {"RequestTimeout",        "RequestTimeout",1},      // Default 1800
+         {"StreamTimeout",         "StreamTimeout",1},
+         {"TransactionTimeout",    "",1},
+         {"WorkerThreads",         "WorkerThreads",0}        // Set To    64
        };
     int i, numopts = sizeof(Sopts)/sizeof(const char *);
 
@@ -890,19 +1024,17 @@ int XrdPssSys::xsopt(XrdSysError *Eroute, XrdOucStream &Config)
         return 1;
        }
 
-    kval = strtol(val, &kvp, 10);
-    if (*kvp)
-       {Eroute->Emsg("Config", kword, "setopt keyword value is invalid -", val);
-        return 1;
-       }
-
     for (i = 0; i < numopts; i++)
         if (!strcmp(Sopts[i].Sopt, kword))
            {if (!Sopts[i].Copt || *(Sopts[i].Copt) == '!')
                {Eroute->Emsg("Config", kword, "no longer supported;",
                              (Sopts[i].Copt ? Sopts[i].Copt+1 : "ignored"));
                } else if (*(Sopts[i].Copt))
-                         {if (*(Sopts[i].Copt) == '*')
+                         {noGo = (Sopts[i].isT
+                               ?  XrdOuca2x::a2tm(*Eroute,kword,val,&kval)
+                               :  XrdOuca2x::a2i (*Eroute,kword,val,&kval));
+                          if (noGo) return 1;
+                          if (*(Sopts[i].Copt) == '*')
                                XrdPosixXrootd::setDebug(kval);
                           else XrdPosixXrootd::setEnv(Sopts[i].Copt, kval);
                          }

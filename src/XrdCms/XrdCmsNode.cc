@@ -44,10 +44,10 @@
 #include "XrdCms/XrdCmsBaseFS.hh"
 #include "XrdCms/XrdCmsCache.hh"
 #include "XrdCms/XrdCmsCluster.hh"
+#include "XrdCms/XrdCmsClustID.hh"
 #include "XrdCms/XrdCmsConfig.hh"
 #include "XrdCms/XrdCmsManager.hh"
 #include "XrdCms/XrdCmsManList.hh"
-#include "XrdCms/XrdCmsManTree.hh"
 #include "XrdCms/XrdCmsMeter.hh"
 #include "XrdCms/XrdCmsPList.hh"
 #include "XrdCms/XrdCmsPrepare.hh"
@@ -56,7 +56,6 @@
 #include "XrdCms/XrdCmsSelect.hh"
 #include "XrdCms/XrdCmsState.hh"
 #include "XrdCms/XrdCmsTrace.hh"
-#include "XrdCms/XrdCmsXmi.hh"
 
 #include "XrdOss/XrdOss.hh"
 
@@ -78,13 +77,19 @@ using namespace XrdCms;
 XrdSysMutex XrdCmsNode::mlMutex;
 
 int         XrdCmsNode::LastFree = 0;
+
+namespace
+{
+XrdNetIF::ifType ifVec[4] = {XrdNetIF::PublicV4, XrdNetIF::Public46,
+                             XrdNetIF::PublicV6, XrdNetIF::Public64};
+};
   
 /******************************************************************************/
 /*                           C o n s t r u c t o r                            */
 /******************************************************************************/
   
 XrdCmsNode::XrdCmsNode(XrdLink *lnkp, const char *theIF, const char *nid,
-                       int port, int lvl, int id)
+                       int port, int lvl, int id) : nodeMutex(0, "nodeCV")
 {
     static XrdSysMutex   iMutex;
     static const SMask_t smask_1(1);
@@ -93,10 +98,11 @@ XrdCmsNode::XrdCmsNode(XrdLink *lnkp, const char *theIF, const char *nid,
     Link     =  lnkp;
     NodeMask =  (id < 0 ? 0 : smask_1 << id);
     NodeID   = id;
-    isDisable=  0;
-    isNoStage=  0;
+    cidP     =  0;
+    hasNet   =  0;
+    isBad    =  0;
     isOffline=  (lnkp == 0);
-    isSuspend=  0;
+    isNoStage=  0;
     isBound  =  0;
     isConn   =  0;
     isGone   =  0;
@@ -104,11 +110,10 @@ XrdCmsNode::XrdCmsNode(XrdLink *lnkp, const char *theIF, const char *nid,
     isMan    =  0;
     isKnown  =  0;
     isPeer   =  0;
-    isProxy  =  0;
+    incUL    =  0;
     myCost   =  0;
     myLoad   =  0;
     myMass   =  0;
-    myCNUM   = -3;
     DiskTotal=  0;
     DiskFree =  0;
     DiskMinF =  0;
@@ -135,6 +140,12 @@ XrdCmsNode::XrdCmsNode(XrdLink *lnkp, const char *theIF, const char *nid,
     ConfigID =  0;
     TZValid  = 0;
     TimeZone = 0;
+    subsPort = 0;
+    myVersion= kYR_Version;
+
+    lkCount  = 0;
+    ulCount  = 0;
+    Manager  = 0;
 
 // setName() will set the node identification information
 //
@@ -156,6 +167,7 @@ XrdCmsNode::~XrdCmsNode()
 
 // Delete other appendages
 //
+   if (cidP) {cidP->RemNode(this); cidP = 0;}
    if (Ident) free(Ident);
    if (myNID) free(myNID);
    if (myName)free(myName);
@@ -167,10 +179,8 @@ XrdCmsNode::~XrdCmsNode()
   
 void XrdCmsNode::setName(XrdLink *lnkp, const char *theIF, int port)
 {
-   EPNAME("setName");
    char buff[512];
-   const char *hname = lnkp->Host(), *oldIF = theIF;
-   int oldPort;
+   const char *hname = lnkp->Host();
 
 // Check if this is a duplicate. Note that we check for strict equivalence.
 //
@@ -188,10 +198,8 @@ void XrdCmsNode::setName(XrdLink *lnkp, const char *theIF, int port)
 // to specify interface addresses as this does not make global sense.
 //
    if (theIF && !netIF.InDomain(&netID)) theIF = 0;
-   oldPort = netID.Port(port);
-   netIF.SetIF(&netID, theIF);
-   netID.Port(oldPort);
-   if (oldIF) {DEBUG(hname<<(theIF ? " using" : " scorn")<<" i/f: "<<oldIF);}
+   netIF.SetIF(&netID, theIF, port);
+   hasNet = netIF.Mask();
 
 // Construct our identification
 //
@@ -205,6 +213,87 @@ void XrdCmsNode::setName(XrdLink *lnkp, const char *theIF, int port)
 }
 
 /******************************************************************************/
+/*                                D e l e t e                                 */
+/******************************************************************************/
+
+void XrdCmsNode::Delete(XrdSysMutex &gMutex)
+{
+   EPNAME("Delete");
+   time_t tNow;
+   unsigned int theLKCnt;
+   int tmoWait = 60, totWait = 0;
+   bool doDel = true;
+
+// We need to make sure there are no references to this object. This is true
+// when the lkCount equals the ulCount. The lkCount is under control of the
+// global mutex passed to us. The ulCount is under control of the node lock.
+// we will wait until they are equal. As this node has been removed from all
+// table at this point, the lkCount cannot change and we need only to fetch
+// it once. However, we will refresh it if we timeout. Setting isGone will
+// signal us whenever the ulCount changes and is under global mutex control.
+//
+   gMutex.Lock();
+   theLKCnt = lkCount;
+   isGone = 1;
+   gMutex.UnLock();
+
+// Get the node lock and do some debugging
+//
+   nodeMutex.Lock();
+   DEBUG(Ident <<" locks=" <<theLKCnt <<" unlocks=" <<ulCount);
+
+// Now wait for things to simmer down. We wait for an appropriate time because
+// we don't want to occupy this thread forever.
+//
+   while(theLKCnt != ulCount)
+        {if (totWait >= Config.DELDelay) {doDel = false; break;}
+         tNow = time(0);
+         if (!nodeMutex.Wait(tmoWait)) totWait += (time(0) - tNow);
+            else {DeleteWarn(gMutex, theLKCnt);
+                  totWait += tmoWait;
+                  tmoWait  = tmoWait << 1;
+                  if (totWait + tmoWait > Config.DELDelay)
+                     {tmoWait = Config.DELDelay - totWait;
+                      if (tmoWait < 30) tmoWait = 30;
+                     }
+                 }
+        }
+
+// We can now safely delete this node
+//
+   nodeMutex.UnLock();
+   if (doDel) delete this;
+      else {char eBuff[256];
+            snprintf(eBuff, sizeof(eBuff),
+                     " (%p) delete timeout; node object lost!", this);
+            Say.Emsg("Delete", Ident, eBuff);
+           }
+}
+  
+/******************************************************************************/
+/* Private:                   D e l e t e W a r n                             */
+/******************************************************************************/
+
+void XrdCmsNode::DeleteWarn(XrdSysMutex &gMutex, unsigned int &lkVal)
+{
+   char eBuff[256];
+
+// Print warning
+//
+   snprintf(eBuff, sizeof(eBuff), "delete sync stall; lk %d != ul %d",
+            lkVal, ulCount);
+   Say.Emsg("Delete", Ident, eBuff);
+
+// Update the lock count
+//
+   nodeMutex.UnLock();
+   gMutex.Lock();
+   lkVal = lkCount;
+   gMutex.UnLock();
+   nodeMutex.Lock();
+}
+  
+/******************************************************************************/
 /*                                  D i s c                                   */
 /******************************************************************************/
 
@@ -213,7 +302,7 @@ void XrdCmsNode::Disc(const char *reason, int needLock)
 
 // Lock the object of not yet locked
 //
-   if (needLock) myMutex.Lock();
+   if (needLock) nodeMutex.Lock();
    isOffline = 1;
 
 // If we are still connected, initiate a teardown
@@ -226,7 +315,7 @@ void XrdCmsNode::Disc(const char *reason, int needLock)
 
 // Unlock ourselves if we locked ourselves
 //
-   if (needLock) myMutex.UnLock();
+   if (needLock) nodeMutex.UnLock();
 }
   
 /******************************************************************************/
@@ -255,7 +344,7 @@ const char *XrdCmsNode::do_Avail(XrdCmsRRData &Arg)
 /*                              d o _ C h m o d                               */
 /******************************************************************************/
   
-// Chmod requests are forwarded to all subscribers subject to an Xmi callout.
+// Chmod requests are forwarded to all subscribers
 //
 const char *XrdCmsNode::do_Chmod(XrdCmsRRData &Arg)
 {
@@ -266,14 +355,6 @@ const char *XrdCmsNode::do_Chmod(XrdCmsRRData &Arg)
 // Do some debugging
 //
    DEBUGR("mode " <<Arg.Mode <<' ' <<Arg.Path);
-
-// If we have an Xmi then call it
-//
-   if (Xmi_Chmod)
-      {XrdCmsReq Req(this, Arg.Request.streamid);
-       if (!getMode(Arg.Mode, mode)) return "invalid mode";
-          else if (Xmi_Chmod->Chmod(&Req, mode, Arg.Path, Arg.Opaque)) return 0;
-      }
 
 // We are don here if we have no data; otherwise convert the mode if we
 // haven't done so already.
@@ -348,11 +429,11 @@ const char *XrdCmsNode::do_Gone(XrdCmsRRData &Arg)
 
 // If we have no managers and we still have the file or never had it, return
 //
-   if (!Manager.Present() || !newgone) return 0;
+   if (!XrdCmsManager::Present() || !newgone) return 0;
 
 // Back-propogate the gone to all of our managers
 //
-   Manager.Inform(Arg.Request, Arg.Buff, Arg.Dlen);
+   XrdCmsManager::Inform(Arg.Request, Arg.Buff, Arg.Dlen);
 
 // All done
 //
@@ -400,11 +481,11 @@ const char *XrdCmsNode::do_Have(XrdCmsRRData &Arg)
 
 // Return if we have no managers or we already informed the managers
 //
-   if (!Manager.Present() || !isnew) return 0;
+   if (!XrdCmsManager::Present() || !isnew) return 0;
 
 // Back-propogate the have to all of our managers
 //
-   Manager.Inform(Arg.Request, Arg.Buff, Arg.Dlen);
+   XrdCmsManager::Inform(Arg.Request, Arg.Buff, Arg.Dlen);
 
 // All done
 //
@@ -497,40 +578,49 @@ const char *XrdCmsNode::do_Locate(XrdCmsRRData &Arg)
            char outbuff[CmsLocateRequest::RHLen*STMax];} Resp;
    struct iovec ioV[2] = {{(char *)&Arg.Request, sizeof(Arg.Request)},
                           {(char *)&Resp,        0}};
-   const char *Why, *What = "public ";
+   const char *Why;
    char eBuff[128], theopts[8], *toP = theopts;
    XrdCmsCluster::CmsLSOpts lsopts = XrdCmsCluster::LS_NULL;
+   XrdNetIF::ifType ifType;
    int rc, bytes;
-   bool oksel, noipv4, nonet, lsall = (*Arg.Path == '*');
+   bool lsuniq = false, oksel = false, lsall = (*Arg.Path == '*');
 
-// Do a callout to the external manager if we have one
+// Get the right interface selection options
 //
-   if (Xmi_Select)
-      {XrdCmsReq Req(this, Arg.Request.streamid);
-       if (Xmi_Select->Select(&Req, XMI_LOCATE, Arg.Path, Arg.Opaque)) return 0;
-      }
+   ifType = ifVec[(Arg.Opts & CmsLocateRequest::kYR_retipmsk)
+                  >> CmsLocateRequest::kYR_retipsft];
 
-// Get the right options
+// Indicate whether we want a name or an actual address
 //
-        if (Arg.Opts & CmsLocateRequest::kYR_retname)
-           lsopts  = XrdCmsCluster::LS_IDNT;
-   else if (Arg.Opts & CmsLocateRequest::kYR_retipv6)
-          {lsopts |= XrdCmsCluster::LS_IP6;
-           if (Arg.Opts & CmsLocateRequest::kYR_retipv4)
-              lsopts |= XrdCmsCluster::LS_IP4;
-          }
-   else if (Arg.Opts & CmsLocateRequest::kYR_retipv4)
-           lsopts |= XrdCmsCluster::LS_IP4;
-   else lsopts = XrdCmsCluster::LS_IPO;
+   lsopts = (Arg.Opts & CmsLocateRequest::kYR_retname
+          ?  XrdCmsCluster::LS_IDNT : XrdCmsCluster::LS_IPO);
+
+// Indicate if only a single server entry should be listed
+//
+   if (Arg.Opts & CmsLocateRequest::kYR_retuniq && baseFS.isDFS())
+      {lsuniq = true; *toP++='u';}
+
+// Indicate whether we can ignore network restrictions
+//
+   if (Arg.Opts & CmsLocateRequest::kYR_listall)
+      lsopts |= XrdCmsCluster::LS_ANY;
+
+// Indicate whether we ony want to list a single entry
+//
 
 // Handle private networks here
 //
    if (Arg.Opts & CmsLocateRequest::kYR_prvtnet)
-      {Sel.Opts |= XrdCmsSelect::Private; What = "private ";
-       lsopts |=  XrdCmsCluster::LS_PRV;  *toP++='P';
+      {XrdNetIF::Privatize(ifType);
+       *toP++='P';
       }
 
-// Grab the refresh option (the only one we support)
+// Encode if type into the options
+//
+   Sel.Opts = static_cast<int>(ifType) & XrdCmsSelect::ifWant;
+   lsopts   = static_cast<XrdCmsCluster::CmsLSOpts>(lsopts | ifType);
+
+// Grab various options
 //
    if (Arg.Opts & CmsLocateRequest::kYR_refresh) 
       {Sel.Opts  = XrdCmsSelect::Refresh; *toP++='s';}
@@ -563,14 +653,13 @@ const char *XrdCmsNode::do_Locate(XrdCmsRRData &Arg)
 // List the servers
 //
    if (!rc)
-      {if (!Sel.Vec.hf
-       ||  !(sP=Cluster.List(Sel.Vec.hf, lsopts, oksel, noipv4, nonet)))
+      {if (!Sel.Vec.hf || !(sP=Cluster.List(Sel.Vec.hf, lsopts, oksel)))
           {const char *eTxt;
            Arg.Request.rrCode = kYR_error;
            if (oksel)
               {rc = kYR_ENETUNREACH; Why = "unreachable ";
-               sprintf(eBuff, "No servers are reachable via %s%snetwork",
-                       (noipv4 ? "ipv4 " : ""), (nonet ? What : ""));
+               sprintf(eBuff, "No servers are reachable via %s network",
+                       XrdNetIF::Name(ifType));
                eTxt = eBuff;
               } else {
                rc = kYR_ENOENT; Why = "none ";
@@ -587,7 +676,7 @@ const char *XrdCmsNode::do_Locate(XrdCmsRRData &Arg)
       {Resp.Val           = htonl(rc);
        DEBUGR(Why <<Arg.Path);
       } else {
-       bytes = do_LocFmt(Resp.outbuff, sP, Sel.Vec.pf, Sel.Vec.wf, lsall)
+       bytes = do_LocFmt(Resp.outbuff, sP, Sel.Vec.pf, Sel.Vec.wf, lsall,lsuniq)
              + sizeof(Resp.Val) + 1;
        Resp.Val            = 0;
        Arg.Request.rrCode  = kYR_data;
@@ -606,13 +695,32 @@ const char *XrdCmsNode::do_Locate(XrdCmsRRData &Arg)
 /******************************************************************************/
   
 int XrdCmsNode::do_LocFmt(char *buff, XrdCmsSelected *sP,
-                          SMask_t pfVec, SMask_t wfVec, bool lsall)
+                          SMask_t pfVec, SMask_t wfVec, bool lsall, bool lsuniq)
 {
    static const int Skip = (XrdCmsSelected::Disable | XrdCmsSelected::Offline);
    static const int Hung = (XrdCmsSelected::Disable | XrdCmsSelected::Offline
                          |  XrdCmsSelected::Suspend);
    XrdCmsSelected *pP;
    char *oP = buff;
+
+// If only unique entries are wanted then we need to only let through
+// all non-servers and one server (prefereably a r/w one)
+//
+if (!lsall && lsuniq)
+   {XrdCmsSelected *xP = 0;
+    bool haverw = false;
+    pP = sP;
+    while(pP)
+         {if (!(pP->Status & (XrdCmsSelected::isMangr | Skip)))
+             {if (haverw) pP->Status |= Skip;
+                 else {if (xP) xP->Status |= Skip;
+                       xP = pP;
+                       haverw = (pP->Mask & wfVec) != 0;
+                      }
+             }
+          pP = pP->next;
+         }
+   }
 
 // format out the request as follows:                   
 // 01234567810123456789212345678
@@ -649,7 +757,7 @@ if (lsall)
 /*                              d o _ M k d i r                               */
 /******************************************************************************/
   
-// Mkdir requests are forwarded to all subscribers subject to an Xmi callout.
+// Mkdir requests are forwarded to all subscribers
 //
 const char *XrdCmsNode::do_Mkdir(XrdCmsRRData &Arg)
 {
@@ -660,14 +768,6 @@ const char *XrdCmsNode::do_Mkdir(XrdCmsRRData &Arg)
 // Do some debugging
 //
    DEBUGR("mode " <<Arg.Mode <<' ' <<Arg.Path);
-
-// If we have an Xmi then call it
-//
-   if (Xmi_Mkdir)
-      {XrdCmsReq Req(this, Arg.Request.streamid);
-       if (!getMode(Arg.Mode, mode)) return "invalid mode";
-          else if (Xmi_Mkdir->Mkdir(&Req, mode, Arg.Path, Arg.Opaque)) return 0;
-      }
 
 // We are don here if we have no data; otherwise convert the mode if we
 // haven't done so already.
@@ -689,7 +789,7 @@ const char *XrdCmsNode::do_Mkdir(XrdCmsRRData &Arg)
 /*                             d o _ M k p a t h                              */
 /******************************************************************************/
   
-// Mkpath requests are forwarded to all subscribers subjectto an Xmi callout.
+// Mkpath requests are forwarded to all subscribers
 //
 const char *XrdCmsNode::do_Mkpath(XrdCmsRRData &Arg)
 {
@@ -700,14 +800,6 @@ const char *XrdCmsNode::do_Mkpath(XrdCmsRRData &Arg)
 // Do some debugging
 //
    DEBUGR("mode " <<Arg.Mode <<' ' <<Arg.Path);
-
-// If we have an Xmi then call it
-//
-   if (Xmi_Mkpath)
-      {XrdCmsReq Req(this, Arg.Request.streamid);
-       if (!getMode(Arg.Mode, mode)) return "invalid mode";
-          else if (Xmi_Mkpath->Mkpath(&Req,mode,Arg.Path,Arg.Opaque)) return 0;
-      }
 
 // We are don here if we have no data; otherwise convert the mode if we
 // haven't done so already.
@@ -729,7 +821,7 @@ const char *XrdCmsNode::do_Mkpath(XrdCmsRRData &Arg)
 /*                                 d o _ M v                                  */
 /******************************************************************************/
   
-// Mv requests are forwarded to all subscribers subject to an Xmi callout.
+// Mv requests are forwarded to all subscribers
 //
 const char *XrdCmsNode::do_Mv(XrdCmsRRData &Arg)
 {
@@ -740,14 +832,6 @@ const char *XrdCmsNode::do_Mv(XrdCmsRRData &Arg)
 // Do some debugging
 //
    DEBUGR(Arg.Path <<" to " <<Arg.Path2);
-
-// If we have an Xmi then call it
-//
-   if (Xmi_Rename)
-      {XrdCmsReq Req(this, Arg.Request.streamid, Arg.Request.modifier & kYR_dnf);
-       if (Xmi_Rename->Rename(&Req,Arg.Path,Arg.Opaque,Arg.Path2,Arg.Opaque2))
-          return 0;
-      }
 
 // If we are not a server, if must remove references to the old and new names
 // from our cache. This is independent of how the raname is handled. We need
@@ -802,6 +886,7 @@ const char *XrdCmsNode::do_Ping(XrdCmsRRData &Arg)
 // Process: ping
 // Respond: pong
 //
+   if (isBad & isDoomed) return ".redirected";
    Link->Send((char *)&pongIt, sizeof(pongIt));
    return 0;
 }
@@ -833,14 +918,6 @@ const char *XrdCmsNode::do_PrepAdd(XrdCmsRRData &Arg)
    DEBUGR("parms: " <<Arg.Reqid <<' ' <<Arg.Notify <<' ' <<Arg.Prty <<' '
                     <<Arg.Mode  <<' ' <<Arg.Path);
 
-// Do an Xmi callout if need be
-//
-   if (Xmi_Prep
-   &&  Xmi_Prep->Prep(Arg.Reqid,
-                      Arg.Opts & CmsPrepAddRequest::kYR_write ? XMI_RW : 0,
-                      Arg.Path, Arg.Opaque))
-       return 0;
-
 // Queue this request for async processing
 //
    (new XrdCmsPrepArgs(Arg))->Queue();
@@ -859,10 +936,6 @@ const char *XrdCmsNode::do_PrepDel(XrdCmsRRData &Arg)
 //
    DEBUGR("reqid " <<Arg.Reqid);
 
-// Do a callout to the external manager if we have one
-//
-   if (Xmi_Prep && Xmi_Prep->Prep(Arg.Reqid, XMI_CANCEL, "", 0)) return 0;
-
 // Cancel the request if applicable.
 //
    if (Config.DiskOK)
@@ -878,7 +951,7 @@ const char *XrdCmsNode::do_PrepDel(XrdCmsRRData &Arg)
 /*                                 d o _ R m                                  */
 /******************************************************************************/
   
-// Rm requests are forwarded to all subscribers subject to an Xmi callout.
+// Rm requests are forwarded to all subscribers
 //
 const char *XrdCmsNode::do_Rm(XrdCmsRRData &Arg)
 {
@@ -889,13 +962,6 @@ const char *XrdCmsNode::do_Rm(XrdCmsRRData &Arg)
 // Do some debugging
 //
    DEBUGR(Arg.Path);
-
-// If we have an Xmi then call it
-//
-   if (Xmi_Remove)
-      {XrdCmsReq Req(this, Arg.Request.streamid, Arg.Request.modifier & kYR_dnf);
-       if (Xmi_Remove->Remove(&Req, Arg.Path, Arg.Opaque)) return 0;
-      }
 
 // If we have no data then we should remove this file from our cache
 //
@@ -920,7 +986,7 @@ const char *XrdCmsNode::do_Rm(XrdCmsRRData &Arg)
 /*                              d o _ R m d i r                               */
 /******************************************************************************/
   
-// Rmdir requests are forwarded to all subscribers subject to an Xmi callout.
+// Rmdir requests are forwarded to all subscribers
 //
 const char *XrdCmsNode::do_Rmdir(XrdCmsRRData &Arg)
 {
@@ -931,13 +997,6 @@ const char *XrdCmsNode::do_Rmdir(XrdCmsRRData &Arg)
 // Do some debugging
 //
    DEBUGR(Arg.Path);
-
-// If we have an Xmi then call it
-//
-   if (Xmi_Remdir)
-      {XrdCmsReq Req(this, Arg.Request.streamid, Arg.Request.modifier & kYR_dnf);
-       if (Xmi_Remdir->Remdir(&Req, Arg.Path, Arg.Opaque)) return 0;
-      }
 
 // If we have no data then we should remove this directory from our cache
 //
@@ -968,34 +1027,29 @@ const char *XrdCmsNode::do_Rmdir(XrdCmsRRData &Arg)
 const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
 {
    EPNAME("do_Select")
+//                      kXR_NotFound  kXR_IOError  kXR_FSError  kXR_ServerError
+   static int rtEC[] = {kYR_ENOENT,   kYR_EIO,     kYR_FSError, kYR_SrvError};
    XrdCmsRRQInfo reqInfo(Instance,RSlot,Arg.Request.streamid,Config.QryMinum);
    XrdCmsSelect Sel(XrdCmsSelect::Peers, Arg.Path, Arg.PathLen-1);
    struct iovec ioV[2];
    char theopts[16], *Avoid, *toP = theopts;
+   XrdNetIF::ifType ifType;
    int rc, bytes;
-
-// Do a callout to the external manager if we have one
-//
-   if (Arg.Opts & CmsSelectRequest::kYR_stat && Xmi_Stat)
-      {XrdCmsReq Req(this, Arg.Request.streamid);
-       if (Xmi_Stat->Stat(&Req, Arg.Path, Arg.Opaque)) return 0;
-      } else 
-   if (Xmi_Select)
-      {XrdCmsReq Req(this, Arg.Request.streamid);
-       int opts = (Arg.Opts & CmsSelectRequest::kYR_write ? XMI_RW : 0);
-       if (Arg.Opts & CmsSelectRequest::kYR_create) opts |= XMI_NEW;
-       if (Arg.Opts & CmsSelectRequest::kYR_trunc)  opts |= XMI_TRUNC;
-       if (Xmi_Select->Select(&Req, opts, Arg.Path, Arg.Opaque)) return 0;
-      }
 
 // Init select data (note that refresh supresses fast redirects)
 //
    Sel.iovP  = 0; Sel.iovN  = 0; Sel.InfoP = &reqInfo;
 
+// Determine what interface to return to the client
+//
+   ifType = ifVec[(Arg.Opts & CmsSelectRequest::kYR_retipmsk)
+                  >> CmsSelectRequest::kYR_retipsft];
+   if (Arg.Opts & CmsSelectRequest::kYR_prvtnet)
+      {XrdNetIF::Privatize(ifType);                                *toP++='P';}
+   Sel.Opts |= static_cast<int>(ifType) & XrdCmsSelect::ifWant;
+
 // Complete the arguments to select
 //
-         if (Arg.Opts & CmsSelectRequest::kYR_prvtnet)
-           {Sel.Opts |= XrdCmsSelect::Private;                     *toP++='P';}
          if (Arg.Opts & CmsSelectRequest::kYR_refresh) 
            {Sel.Opts |= XrdCmsSelect::Refresh;                     *toP++='s';}
          if (Arg.Opts & CmsSelectRequest::kYR_online)  
@@ -1005,7 +1059,10 @@ const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
    else {if (Arg.Opts & CmsSelectRequest::kYR_trunc)   
            {Sel.Opts |= XrdCmsSelect::Write | XrdCmsSelect::Trunc; *toP++='t';}
          if (Arg.Opts & CmsSelectRequest::kYR_write)   
-           {Sel.Opts |= XrdCmsSelect::Write;                       *toP++='w';}
+           {Sel.Opts |= XrdCmsSelect::Write;                       *toP++='w';
+            if (Arg.Opts & CmsSelectRequest::kYR_mwfiles || !Config.DoMWChk)
+               {Sel.Opts |= XrdCmsSelect::MWFiles;                *(toP-1)='W';}
+            }
          if (Arg.Opts & CmsSelectRequest::kYR_metaop)
            {Sel.Opts |= XrdCmsSelect::Write|XrdCmsSelect::isMeta;  *toP++='m';}
          if (Arg.Opts & CmsSelectRequest::kYR_create)  
@@ -1016,6 +1073,25 @@ const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
         }
    *toP = '\0';
 
+// If the client can override selection mode, check if this has been done. Note
+// that true packed selection turns off fast redirect.
+//
+   if (Config.sched_Force || !(Arg.Opts & CmsSelectRequest::kYR_aSpec))
+      {if (Config.sched_Pack)
+          {Sel.Opts |= XrdCmsSelect::Pack;
+           if (Config.sched_Pack > 1) Sel.InfoP = 0;
+           if (!Config.sched_Level) Sel.Opts |= XrdCmsSelect::UseRef;
+          }
+      } else {
+       if (Arg.Opts & CmsSelectRequest::kYR_aPack)
+          {Sel.Opts |= XrdCmsSelect::Pack;
+           if (Arg.Opts  & CmsSelectRequest::kYR_aWait) Sel.InfoP = 0;
+           if ((Arg.Opts & CmsSelectRequest::kYR_aPack) ==
+                           CmsSelectRequest::kYR_aStrict)
+              Sel.Opts |= XrdCmsSelect::UseRef;
+          }
+      }
+
 // Check if an avoid node present. If so, this is ineligible for fast redirect.
 //
    Sel.nmask = SMask_t(0);
@@ -1023,6 +1099,8 @@ const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
       {XrdNetAddr avoidAddr;
        char *Comma;
        DEBUGR(theopts <<' ' <<Arg.Path <<" avoiding " <<Avoid);
+       if (Arg.Opts & CmsSelectRequest::kYR_tryRSEL)
+          Sel.Opts |= XrdCmsSelect::NoTryLim;
        Sel.InfoP = 0;
        do {if ((Comma = index(Avoid,','))) *Comma = '\0';
            if (*Avoid == '+') Sel.nmask |= Cluster.getMask(Avoid+1);
@@ -1042,7 +1120,11 @@ const char *XrdCmsNode::do_Select(XrdCmsRRData &Arg)
            DEBUGR("delay " <<rc <<' ' <<Arg.Path);
           } else {
            Arg.Request.rrCode = kYR_error;
-           Sel.Resp.Port      = kYR_ENOENT;
+           if (rc != XrdCmsCluster::RetryErr) Sel.Resp.Port = kYR_ENOENT;
+              else {int rtRC = (Arg.Opts & CmsSelectRequest::kYR_tryMASK)
+                               >> CmsSelectRequest::kYR_trySHFT;
+                    Sel.Resp.Port = rtEC[rtRC];
+                   }
            DEBUGR("failed; " <<Sel.Resp.Data << ' ' <<Arg.Path);
           }
       } else if (!Sel.Resp.DLen) return 0;
@@ -1080,13 +1162,6 @@ int XrdCmsNode::do_SelPrep(XrdCmsPrepArgs &Arg) // Static!!!
    XrdCmsSelect Sel(XrdCmsSelect::Peers, Arg.path, Arg.pathlen-1);
    int rc;
 
-// Do a callout to the external manager if we have one
-//
-   if (Xmi_Prep)
-      {int opts = (Arg.options & CmsPrepAddRequest::kYR_write ? XMI_RW : 0);
-       if (Xmi_Prep->Prep(Arg.reqid, opts, Arg.path, Arg.opaque)) return 0;
-      }
-
 // Complete the arguments to select
 //
    if ( Arg.options & CmsPrepAddRequest::kYR_fresh)
@@ -1103,6 +1178,11 @@ int XrdCmsNode::do_SelPrep(XrdCmsPrepArgs &Arg) // Static!!!
 //
    Sel.InfoP = 0;  // No fast redirects
    Sel.nmask = SMask_t(0);
+
+// We do not care what interface is being used. This may conflict with a
+// staging prepare but it's too complicated to handle at this point.
+//
+   Sel.Opts |= static_cast<char>(XrdNetIF::ifAny);
 
 // Check if co-location wanted relevant only when staging wanted
 //
@@ -1168,7 +1248,8 @@ const char *XrdCmsNode::do_Space(XrdCmsRRData &Arg)
 
 // Send the response
 //
-   if (Arg.Request.rrCode != kYR_space) Manager.Inform(mySpace.Hdr, buff, blen);
+   if (Arg.Request.rrCode != kYR_space)
+      XrdCmsManager::Inform(mySpace.Hdr, buff, blen);
       else {xmsg[0].iov_base = (char *)&mySpace;
             xmsg[0].iov_len  = sizeof(mySpace);
             xmsg[1].iov_base = buff;
@@ -1275,10 +1356,10 @@ void XrdCmsNode::do_StateDFS(XrdCmsBaseFR *rP, int rc)
 // point we will only inform the manager that actually wants to know. This
 // is encoded to the route passed to us.
 //
-   if (Manager.Present() && isNew
+   if (XrdCmsManager::Present() && isNew
    && !(rP->Mod & CmsStateRequest::kYR_noresp))
       {Request.rrCode   = kYR_have;
-       Manager.Inform(Request, rP->Path, rP->PathLen+1);
+       XrdCmsManager::Inform(Request, rP->Path, rP->PathLen+1);
       }
 }
   
@@ -1379,9 +1460,16 @@ const char *XrdCmsNode::do_StatFS(XrdCmsRRData &Arg)
 //
    if (Cache.Paths.Find(Arg.Path, pinfo) && pinfo.rovec)
       {Cluster.Space(theSpace, pinfo.rovec);
-       bytes = sprintf(buff, "%d %d %d %d %d %d",
-                       theSpace.wNum, theSpace.wFree>>10, theSpace.wUtil,
-                       theSpace.sNum, theSpace.sFree>>10, theSpace.sUtil) + 1;
+       if (Arg.Request.modifier &  CmsStatfsRequest::kYR_qvfs)
+          {bytes = sprintf(buff, "A %lld %lld %d",
+                       theSpace.Total, theSpace.TotFr,
+                      (theSpace.wFree < theSpace.sFree ? theSpace.sFree
+                                                       : theSpace.wFree)) + 1;
+          } else {
+           bytes = sprintf(buff, "%d %d %d %d %d %d",
+                       theSpace.wNum, theSpace.wFree, theSpace.wUtil,
+                       theSpace.sNum, theSpace.sFree, theSpace.sUtil) + 1;
+          }
       } else bytes = strlcpy(buff, "-1 -1 -1 -1 -1 -1", sizeof(buff)) + 1;
 
 // Send the response
@@ -1485,7 +1573,7 @@ const char *XrdCmsNode::do_Status(XrdCmsRRData &Arg)
 // Process reset requests. These are exclsuive to any other request
 //
    if (Reset)
-      {Manager.Reset();                // Propagate the reset to our managers
+      {XrdCmsManager::Reset();         // Propagate the reset to our managers
        Cache.Bounce(NodeMask, NodeID); // Now invalidate our cache lines
       }
 
@@ -1498,17 +1586,17 @@ const char *XrdCmsNode::do_Status(XrdCmsRRData &Arg)
 
 // Process suspend/resume
 //
-    if ((Resume && isSuspend) || (Suspend && !isSuspend))
-       if (Suspend) {add2Activ = -1; isSuspend = 1;
+    if ((Resume && (isBad & isSuspend)) || (Suspend && !(isBad & isSuspend)))
+       if (Suspend) {add2Activ = -1; isBad |=  isSuspend;
                      srvMsg="service suspended"; 
                      stgMsg = 0;
                     }
-          else      {add2Activ =  1; isSuspend = 0;
+          else      {add2Activ =  1; isBad &= ~isSuspend;
                      srvMsg="service resumed";
                      stgMsg = (isNoStage ? "(no staging)" : "(staging)");
                      port = ntohl(Arg.Request.streamid);
                      if (port && port != netIF.Port())
-                        {Lock(); netIF.Port(port); UnLock();
+                        {Lock(false); netIF.Port(port); UnLock();
                          DEBUGR("set data port to " <<port);
                         }
                     }
@@ -1516,8 +1604,9 @@ const char *XrdCmsNode::do_Status(XrdCmsRRData &Arg)
 
 // Get the most important message out
 //
-   if (isOffline)         {srvMsg = "service offline";  stgMsg = 0;}
-      else if (isDisable) {srvMsg = "service disabled"; stgMsg = 0;}
+        if (isOffline)          {srvMsg = "service offline";     stgMsg = 0;}
+   else if (isBad & isDisabled) {srvMsg = "service disabled";    stgMsg = 0;}
+   else if (isBad & isBlisted ) {srvMsg = "service blacklisted"; stgMsg = 0;}
 
 // Now see if we need to change anything
 //
@@ -1533,8 +1622,7 @@ const char *XrdCmsNode::do_Status(XrdCmsRRData &Arg)
 /*                              d o _ T r u n c                               */
 /******************************************************************************/
   
-// Trunc requests are forwarded to all subscribers subject to an Xmi callout.
-// Currently, we have no definition in Xmi for trunc!
+// Trunc requests are forwarded to all subscribers
 //
 const char *XrdCmsNode::do_Trunc(XrdCmsRRData &Arg)
 {
@@ -1545,14 +1633,6 @@ const char *XrdCmsNode::do_Trunc(XrdCmsRRData &Arg)
 // Do some debugging
 //
    DEBUGR("size " <<Arg.Mode <<' ' <<Arg.Path);
-
-// If we have an Xmi then call it
-//
-// if (Xmi_Trunc)
-//    {XrdCmsReq Req(this, Arg.Request.streamid);
-//     if (!getSize(Arg.Mode, Size)) return "invalid size";
-//        else if (Xmi_Trunc->Trunc(&Req, Size, Arg.Path, Arg.Opaque)) return 0;
-//    }
 
 // We are don here if we have no data; otherwise convert the mode if we
 // haven't done so already.
@@ -1587,7 +1667,7 @@ const char *XrdCmsNode::do_Try(XrdCmsRRData &Arg)
 
 // Add all the alternates to our alternate list
 //
-   myMans.Add(&netID, Arg.Path, Config.PortTCP, myLevel);
+   if (Manager) Manager->myMans->Add(&netID, Arg.Path, Config.PortTCP, myLevel);
 
 // Close the link and return an error
 //
@@ -1658,7 +1738,7 @@ void XrdCmsNode::Report_Usage(XrdLink *lp)   // Static!
    xmsg[1].iov_base = respbuff;
    xmsg[1].iov_len  = blen;
    if (lp) lp->Send(xmsg, 2);
-      else Manager.Inform("usage", xmsg, 2);
+      else XrdCmsManager::Inform("usage", xmsg, 2);
 
 // Do some debugging
 //

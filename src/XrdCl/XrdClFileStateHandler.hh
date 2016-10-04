@@ -35,6 +35,7 @@
 
 namespace XrdCl
 {
+  class ResponseHandlerHolder;
   class Message;
 
   //----------------------------------------------------------------------------
@@ -60,6 +61,14 @@ namespace XrdCl
       //! Constructor
       //------------------------------------------------------------------------
       FileStateHandler();
+
+      //------------------------------------------------------------------------
+      //! Constructor
+      //!
+      //! @param useVirtRedirector if true Metalink files will be treated
+      //!                          as a VirtualRedirectors
+      //------------------------------------------------------------------------
+      FileStateHandler( bool useVirtRedirector );
 
       //------------------------------------------------------------------------
       //! Destructor
@@ -420,6 +429,8 @@ namespace XrdCl
       bool                    pDoRecoverRead;
       bool                    pDoRecoverWrite;
       bool                    pFollowRedirects;
+      bool                    pDoneInitOpen;
+      bool                    pUseVirtRedirector;
 
       //------------------------------------------------------------------------
       // Monitoring variables
@@ -433,6 +444,12 @@ namespace XrdCl
       uint64_t                 pVCount;
       uint64_t                 pWCount;
       XRootDStatus             pCloseReason;
+
+      //------------------------------------------------------------------------
+      // Holds the OpenHanlder used to issue reopen
+      // (there is only only OpenHandler reopening a file at a time)
+      //------------------------------------------------------------------------
+      ResponseHandlerHolder *pReOpenHandler;
   };
 }
 

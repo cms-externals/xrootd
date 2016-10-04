@@ -41,6 +41,38 @@
 namespace
 {
   //----------------------------------------------------------------------------
+  //! Wrapper class used to delete FileSystem object
+  //----------------------------------------------------------------------------
+  class DeallocFSHandler: public XrdCl::ResponseHandler
+  {
+    public:
+      //------------------------------------------------------------------------
+      // Constructor and destructor
+      //------------------------------------------------------------------------
+      DeallocFSHandler( XrdCl::FileSystem *fs, ResponseHandler *userHandler ):
+        pFS(fs), pUserHandler(userHandler) {}
+
+      virtual ~DeallocFSHandler()
+      {
+        delete pFS;
+      }
+
+      //------------------------------------------------------------------------
+      // Handle the response
+      //------------------------------------------------------------------------
+      virtual void HandleResponse( XrdCl::XRootDStatus *status,
+                                   XrdCl::AnyObject    *response )
+      {
+        pUserHandler->HandleResponse(status, response);
+        delete this;
+      }
+
+    private:
+      XrdCl::FileSystem      *pFS;
+      ResponseHandler *pUserHandler;
+  };
+
+  //----------------------------------------------------------------------------
   // Deep locate handler
   //----------------------------------------------------------------------------
   class DeepLocateHandler: public XrdCl::ResponseHandler
@@ -151,8 +183,8 @@ namespace
           //--------------------------------------------------------------------
           if( it->IsManager() )
           {
-            FileSystem fs( it->GetAddress() );
-            if( fs.Locate( pPath, pFlags, this, pExpires-::time(0)).IsOK() )
+            FileSystem *fs = new FileSystem( it->GetAddress() );
+            if( fs->Locate( pPath, pFlags, new DeallocFSHandler(fs, this), pExpires-::time(0)).IsOK() )
               ++pOutstanding;
           }
         }
@@ -345,7 +377,11 @@ namespace XrdCl
   FileSystem::~FileSystem()
   {
     if( !pPlugIn )
-      DefaultEnv::GetForkHandler()->UnRegisterFileSystemObject( this );
+    {
+      if( DefaultEnv::GetForkHandler() )
+        DefaultEnv::GetForkHandler()->UnRegisterFileSystemObject( this );
+    }
+
     delete pUrl;
     delete pPlugIn;
   }
@@ -907,7 +943,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       LocationInfo *locations;
       std::string locatePath = "*"; locatePath += path;
-      XRootDStatus st = DeepLocate( locatePath, OpenFlags::None, locations );
+      XRootDStatus st = DeepLocate( locatePath, OpenFlags::PrefName, locations );
 
       if( !st.IsOK() )
         return st;

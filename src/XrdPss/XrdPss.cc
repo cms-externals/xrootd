@@ -48,6 +48,7 @@
 #include "XrdVersion.hh"
 
 #include "XrdFfs/XrdFfsPosix.hh"
+#include "XrdNet/XrdNetSecurity.hh"
 #include "XrdPss/XrdPss.hh"
 #include "XrdPosix/XrdPosixXrootd.hh"
 
@@ -81,7 +82,17 @@ static XrdPssSys   XrdProxySS;
 
 static XrdScheduler *schedP = 0;
 
+       XrdOucSid    *sidP   = 0;
+
+static const char *ofslclCGI = "ofs.lcl=1";
+static const int   ofslclCGL = strlen(ofslclCGI);
+
+static const char *osslclCGI = "oss.lcl=1";
+static const int   osslclCGL = strlen(osslclCGI);
+
 static const int   PBsz = 4096;
+
+static const int   CBsz = 2048;
 }
 
 using namespace XrdProxy;
@@ -254,8 +265,9 @@ const char *XrdPssSys::Lfn2Pfn(const char *oldp, char *newp, int blen, int &rc)
 
 int XrdPssSys::Mkdir(const char *path, mode_t mode, int mkpath, XrdOucEnv *eP)
 {
+   int retc, CgiLen = 0;
+   const char *Cgi = (eP ? eP->Env(CgiLen) : 0);
    char pbuff[PBsz];
-   int retc;
 
 // Verify we can write here
 //
@@ -263,7 +275,7 @@ int XrdPssSys::Mkdir(const char *path, mode_t mode, int mkpath, XrdOucEnv *eP)
 
 // Convert path to URL
 //
-   if (!P2URL(retc, pbuff, PBsz, path)) return retc;
+   if (!P2URL(retc, pbuff, PBsz, path, 0, Cgi, CgiLen)) return retc;
 
 // Simply return the proxied result here
 //
@@ -284,23 +296,32 @@ int XrdPssSys::Mkdir(const char *path, mode_t mode, int mkpath, XrdOucEnv *eP)
 */
 int XrdPssSys::Remdir(const char *path, int Opts, XrdOucEnv *eP)
 {
-   const char *Cgi = (Opts & XRDOSS_Online ? "ofs.lcl=1" : "");
-   char pbuff[PBsz], *subPath;
-   int rc;
+   int rc, CgiLen = 0;
+   const char *Cgi  = (eP ? eP->Env(CgiLen) : 0);
+   char pbuff[PBsz], cbuff[CBsz], *subPath;
 
 // Verify we can write here
 //
    if (isREADONLY(path)) return -EROFS;
 
+// Setup any required cgi information
+//
+   if (*path == '/' && !outProxy && (Opts & XRDOSS_Online))
+      {if (!Cgi) {Cgi = ofslclCGI; CgiLen = ofslclCGL;}
+          else   {Cgi = P2CGI(CgiLen, cbuff, sizeof(cbuff), Cgi, ofslclCGI);
+                  if (!Cgi) return -ENAMETOOLONG;
+                 }
+      }
+
 // Convert path to URL
 //
-   if (!(subPath = P2URL(rc, pbuff, PBsz, path, allRmdir, Cgi, strlen(Cgi))))
+   if (!(subPath = P2URL(rc, pbuff, PBsz, path, allRmdir, Cgi, CgiLen)))
       return rc;
 
 // If unlinks are being forwarded, just execute this on a single node.
 // Otherwise, make sure it it's not the base dir and execute everywhere.
 //
-   if (!allRm) rc = XrdPosixXrootd::Rmdir(pbuff);
+   if (!allRmdir || *path != '/') rc = XrdPosixXrootd::Rmdir(pbuff);
       else {if (!(*subPath)) return -EPERM;
             if (!cfgDone)    return -EBUSY;
             rc = XrdFfsPosix_rmdirall(pbuff, subPath, myUid);
@@ -328,16 +349,24 @@ int XrdPssSys::Remdir(const char *path, int Opts, XrdOucEnv *eP)
 int XrdPssSys::Rename(const char *oldname, const char *newname,
                       XrdOucEnv  *oldenvP, XrdOucEnv  *newenvP)
 {
+   const char *oldCgi, *newCgi;
    char oldName[PBsz], *oldSubP, newName[PBsz], *newSubP;
-   int retc;
+   int retc, oldCgiLen, newCgiLen;
 
 // Verify we can write in the source and target
 //
    if (isREADONLY(oldname) || isREADONLY(newname)) return -EROFS;
 
+// Grab any cgi information
+//
+   if (oldenvP) oldCgi = oldenvP->Env(oldCgiLen);
+      else     {oldCgi = 0; oldCgiLen = 0;}
+   if (newenvP) newCgi = newenvP->Env(newCgiLen);
+      else     {newCgi = 0; newCgiLen = 0;}
+
 // If we are not forwarding the request, manually execute it everywhere.
 //
-   if (allMv)
+   if (allMv && *oldname == '/')
       {if (!cfgDone) return -EBUSY;
        return (XrdFfsPosix_renameall(urlPlain, oldname, newname, myUid)
               ? -errno : XrdOssOK);
@@ -345,8 +374,8 @@ int XrdPssSys::Rename(const char *oldname, const char *newname,
 
 // Convert path to URL
 //
-   if (!(oldSubP = P2URL(retc, oldName, PBsz, oldname))
-   ||  !(newSubP = P2URL(retc, newName, PBsz, newname)))
+   if (!(oldSubP = P2URL(retc, oldName, PBsz, oldname, 0, oldCgi, oldCgiLen))
+   ||  !(newSubP = P2URL(retc, newName, PBsz, newname, 0, newCgi, newCgiLen)))
        return retc;
 
 // Execute the rename and return result
@@ -374,25 +403,34 @@ int XrdPssSys::Rename(const char *oldname, const char *newname,
 
 int XrdPssSys::Stat(const char *path, struct stat *buff, int Opts, XrdOucEnv *eP)
 {
-   static const char *noStageCGI = "oss.lcl=1";
-   static const int   noStageCGL = strlen(noStageCGI);
-   const char *Cgi;
-   char pbuff[PBsz];
-   int CgiLen, retc;
+   int CgiLen = 0, retc;
+   const char *Cgi = (eP ? eP->Env(CgiLen) : 0);
+   char *theID, idBuff[16], pbuff[PBsz], cbuff[CBsz];
+   XrdOucSid::theSid idVal;
 
 // Setup any required cgi information
 //
-   if ((Opts & XRDOSS_resonly) || isNOSTAGE(path))
-      {Cgi = noStageCGI; CgiLen = noStageCGL;}
-      else {Cgi = 0; CgiLen = 0;}
+   if (*path == '/' && !outProxy && ((Opts & XRDOSS_resonly)||isNOSTAGE(path)))
+      {if (!Cgi) {Cgi = osslclCGI; CgiLen = osslclCGL;}
+          else   {Cgi = P2CGI(CgiLen, cbuff, sizeof(cbuff), Cgi, osslclCGI);
+                  if (!Cgi) return -ENAMETOOLONG;
+                 }
+      }
+
+// Generate an ID if we need to
+//
+   if (sidP) theID = P2ID(&idVal, idBuff, sizeof(idBuff));
+      else   theID = 0;
 
 // Convert path to URL
 //
-   if (!P2URL(retc, pbuff, PBsz, path, 0, Cgi, CgiLen)) return retc;
+   if (!P2URL(retc, pbuff, PBsz, path, 0, Cgi, CgiLen, theID)) return retc;
 
 // Return proxied stat
 //
-   return (XrdPosixXrootd::Stat(pbuff, buff) ? -errno : XrdOssOK);
+   retc = XrdPosixXrootd::Stat(pbuff, buff);
+   if (theID) sidP->Release(&idVal);
+   return (retc ? -errno : XrdOssOK);
 }
 
 /******************************************************************************/
@@ -411,8 +449,9 @@ int XrdPssSys::Stat(const char *path, struct stat *buff, int Opts, XrdOucEnv *eP
 int XrdPssSys::Truncate(const char *path, unsigned long long flen,
                         XrdOucEnv *envP)
 {
+   int CgiLen = 0, retc;
+   const char *Cgi = (envP ? envP->Env(CgiLen) : 0);
    char pbuff[PBsz];
-   int retc;
 
 // Make sure we can write here
 //
@@ -420,7 +459,7 @@ int XrdPssSys::Truncate(const char *path, unsigned long long flen,
 
 // Convert path to URL
 //
-   if (!P2URL(retc, pbuff, PBsz, path)) return retc;
+   if (!P2URL(retc, pbuff, PBsz, path, 0, Cgi, CgiLen)) return retc;
 
 // Return proxied truncate. We only do this on a single machine because the
 // redirector will forbid the trunc() if multiple copies exist.
@@ -442,23 +481,32 @@ int XrdPssSys::Truncate(const char *path, unsigned long long flen,
 */
 int XrdPssSys::Unlink(const char *path, int Opts, XrdOucEnv *envP)
 {
-   const char *Cgi = (Opts & XRDOSS_Online ? "ofs.lcl=1" : "");
-   char pbuff[PBsz], *subPath;
-   int rc;
+   int CgiLen = 0, rc;
+   const char *Cgi = (envP ? envP->Env(CgiLen) : 0);
+   char *subPath, pbuff[PBsz], cbuff[CBsz];
 
 // Make sure we can write here
 //
    if (isREADONLY(path)) return -EROFS;
 
+// Setup any required cgi information
+//
+   if (*path == '/' && !outProxy && (Opts & XRDOSS_Online))
+      {if (!Cgi) {Cgi = ofslclCGI; CgiLen = ofslclCGL;}
+          else   {Cgi = P2CGI(CgiLen, cbuff, sizeof(cbuff), Cgi, ofslclCGI);
+                  if (!Cgi) return -ENAMETOOLONG;
+                 }
+      }
+
 // Convert path to URL
 //
-   if (!(subPath = P2URL(rc, pbuff, PBsz, path, allRm, Cgi, strlen(Cgi))))
+   if (!(subPath = P2URL(rc, pbuff, PBsz, path, allRm, Cgi, CgiLen)))
       return rc;
 
 // If unlinks are being forwarded, just execute this on a single node.
 // Otherwise, make sure it may be a file and execute everywhere.
 //
-   if (!allRm) rc = XrdPosixXrootd::Unlink(pbuff);
+   if (!allRm || *path != '/') rc = XrdPosixXrootd::Unlink(pbuff);
       else {if (!(*subPath)) return -EISDIR;
             if (!cfgDone)    return -EBUSY;
             rc = XrdFfsPosix_unlinkall(pbuff, subPath, myUid);
@@ -486,26 +534,27 @@ int XrdPssSys::Unlink(const char *path, int Opts, XrdOucEnv *envP)
 */
 int XrdPssDir::Opendir(const char *dir_path, XrdOucEnv &Env)
 {
+   int CgiLen, retc;
+   const char *Cgi = Env.Env(CgiLen);
    char pbuff[PBsz], *subPath;
-   int retc, theUid = XrdPssSys::T2UID(tident);
 
 // Return an error if this object is already open
 //
-   if (dirVec) return -XRDOSS_E8001;
-   if (!XrdProxySS.cfgDone) return -EBUSY;
+   if (myDir) return -XRDOSS_E8001;
+
+// Open directories are not supported for object id's
+//
+   if (*dir_path != '/') return -ENOTSUP;
 
 // Convert path to URL
 //
-   if (!(subPath = XrdPssSys::P2URL(retc,pbuff,PBsz,dir_path))) return retc;
+   if (!(subPath = XrdPssSys::P2URL(retc,pbuff,PBsz,dir_path,0,Cgi,CgiLen)))
+      return retc;
 
-// Return proxied result
+// Open the directory
 //
-   if ((numEnt = XrdFfsPosix_readdirall(pbuff, "", &dirVec, theUid)) < 0)
-       {int rc = -errno;
-        if (dirVec) {free(dirVec); dirVec = 0;}
-        return rc;
-        } else curEnt = 0;
-
+   myDir = XrdPosixXrootd::Opendir(pbuff);
+   if (!myDir) return -errno;
    return XrdOssOK;
 }
 
@@ -530,19 +579,20 @@ int XrdPssDir::Opendir(const char *dir_path, XrdOucEnv &Env)
 */
 int XrdPssDir::Readdir(char *buff, int blen)
 {
-
-// Check if this object is actually open
+// Check if we are directly reading the directory
 //
-   if (!dirVec) return -XRDOSS_E8002;
+   if (myDir)
+      {dirent *entP, myEnt;
+       int    rc = XrdPosixXrootd::Readdir_r(myDir, &myEnt, &entP);
+       if (rc) return -rc;
+       if (!entP) *buff = 0;
+          else strlcpy(buff, myEnt.d_name, blen);
+       return XrdOssOK;
+      }
 
-// Return a single entry
+// The directory is not open
 //
-   if (curEnt >= numEnt) *buff = 0;
-      else {strlcpy(buff, dirVec[curEnt], blen);
-            free(dirVec[curEnt]);
-            curEnt++;
-           }
-   return XrdOssOK;
+   return -XRDOSS_E8002;
 }
 
 /******************************************************************************/
@@ -558,18 +608,18 @@ int XrdPssDir::Readdir(char *buff, int blen)
 */
 int XrdPssDir::Close(long long *retsz)
 {
-   int i;
 
-// Make sure this object is open
+// Close the directory proper if it exists
 //
-   if (!dirVec) return -XRDOSS_E8002;
+   if (myDir)
+      {if (XrdPosixXrootd::Closedir(myDir)) return -errno;
+       myDir = 0;
+       return XrdOssOK;
+      }
 
-// Free up remaining storage
+// Directory is not open
 //
-   for (i = curEnt; i < numEnt; i++) free(dirVec[i]);
-   free(dirVec);
-   dirVec = 0;
-   return XrdOssOK;
+   return -XRDOSS_E8002;
 }
 
 /******************************************************************************/
@@ -591,11 +641,9 @@ int XrdPssDir::Close(long long *retsz)
 */
 int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
 {
-   static const char *noStageCGI = "oss.lcl=1";
-   static const int   noStageCGL = strlen(noStageCGI);
    unsigned long long popts = XrdPssSys::XPList.Find(path);
    const char *Cgi;
-   char pbuff[PBsz], cgbuff[PBsz];
+   char pbuff[PBsz], cbuff[CBsz];
    int CgiLen, retc;
 
 // Return an error if the object is already open
@@ -609,19 +657,19 @@ int XrdPssFile::Open(const char *path, int Oflag, mode_t Mode, XrdOucEnv &Env)
           else return -EROFS;
       }
 
-// Setup any required cgi information
+// Setup any required cgi information. Don't mess with it if it's an objectid
+// or if the we are an outgoing proxy server.
 //
    Cgi= Env.Env(CgiLen);
-   if (!(XRDEXP_STAGE & popts))
-      {if (!CgiLen) {Cgi = noStageCGI; CgiLen = noStageCGL;}
-          else {int n = CgiLen + noStageCGL + 1;
-                if (n >= PBsz) return -ENAMETOOLONG;
-                strcpy(cgbuff, Cgi);
-                cgbuff[CgiLen] = '&';
-                strcpy(cgbuff+CgiLen+1, noStageCGI);
-                Cgi = cgbuff; CgiLen = n;
-               }
-       }
+   if (!XrdPssSys::outProxy && *path == '/')
+      {if (!(XRDEXP_STAGE & popts))
+          {if (!CgiLen) {Cgi = osslclCGI; CgiLen = osslclCGL;}
+              else      {Cgi = XrdPssSys::P2CGI(CgiLen, cbuff, sizeof(cbuff),
+                                                Cgi, osslclCGI);
+                         if (!Cgi) return -ENAMETOOLONG;
+                        }
+          }
+      }
 
 // Convert path to URL
 //
@@ -652,7 +700,9 @@ int XrdPssFile::Close(long long *retsz)
 {
     if (fd < 0) return -XRDOSS_E8004;
     if (retsz) *retsz = 0;
-    return XrdPosixXrootd::Close(fd) ? -errno : XrdOssOK;
+    if (XrdPosixXrootd::Close(fd)) return -errno;
+    fd = -1;
+    return XrdOssOK;
 }
 
 /******************************************************************************/
@@ -880,6 +930,143 @@ int XrdPssFile::isCompressed(char *cxidp)  // Not supported for proxies
 }
 
 /******************************************************************************/
+/*                                 P 2 C G I                                  */
+/******************************************************************************/
+
+const char *XrdPssSys::P2CGI(int &cgilen, char *cbuff, int cblen,
+                             const char *Cgi1, const char *Cgi2)
+{
+
+// If there is no existing cgi return the suffix only
+//
+   if (!Cgi1) {cgilen = strlen(Cgi2); return Cgi2;}
+   if (!Cgi2) return Cgi1;
+
+// Compose the two cgi elements together
+//
+   cgilen = snprintf(cbuff, cblen, "%s&%s", Cgi1, Cgi2);
+   return (cgilen >= cblen ? 0 : cbuff);
+}
+  
+/******************************************************************************/
+/*                                 P 2 D S T                                  */
+/******************************************************************************/
+
+int XrdPssSys::P2DST(int &retc, char *hBuff, int hBlen, XrdPssSys::PolAct pEnt,
+                     const char *path)
+{
+   const char *Slash;
+   int n;
+
+// Extract out the destination
+//
+   Slash = index(path, '/');
+   if (!Slash || (n = (Slash - path)) == 0) {retc = -EINVAL; return 0;}
+   if (n >= hBlen) {retc = -ENAMETOOLONG; return 0;}
+   strncpy(hBuff, path, n); hBuff[n] = 0;
+
+// Check if we need to authorize the outgoing connection
+//
+   if (Police[pEnt] && !Police[pEnt]->Authorize(hBuff))
+      {retc = -EACCES; return 0;}
+
+// All is well
+//
+   return n;
+}
+
+/******************************************************************************/
+/*                                  P 2 I D                                   */
+/******************************************************************************/
+  
+char *XrdPssSys::P2ID(XrdOucSid::theSid *idVal, char *idBuff, int idBsz)
+{
+// Obtain a stream ID
+//
+   if (!(sidP->Obtain(idVal))) return 0;
+
+// Convert it to a user name (7 chars max plus hdr)
+//
+   if (idBsz <= snprintf(idBuff, idBsz, "=pxy%d@", idVal->sidS))
+      {sidP->Release(idVal);
+       return 0;
+      }
+
+// All done
+//
+   return idBuff;
+}
+
+/******************************************************************************/
+/*                                 P 2 O U T                                  */
+/******************************************************************************/
+  
+char *XrdPssSys::P2OUT(int &retc,  char *pbuff, int pblen,
+                 const char *path, const char *Cgi, const char *Ident)
+{
+   char  hBuff[288], idBuff[8], *idP;
+   const char *theID = "", *Quest = "", *thePath = path;
+   int n;
+
+// If we have an Ident then use the fd number as the userid. This allows us to
+// have one stream per open connection.
+//
+   if (Ident && (Ident = index(Ident, ':')))
+      {strncpy(idBuff, Ident+1, 7); idBuff[7] = 0;
+       if ((idP = index(idBuff, '@'))) {*(idP+1) = 0; theID = idBuff;}
+      }
+
+// Prehandle the cgi information
+//
+   if (Cgi) Quest = "?";
+      else  Cgi   = "";
+
+// Make sure the path is valid for an outgoing proxy
+//
+   if (*path == '/') path++;
+   if (*path == 'x') path++;
+   if (!strncmp("root:/", path, 6)) path += 6;
+      else {if (!hdrLen) {retc = -ENOTSUP; return 0;}
+            n = snprintf(pbuff, pblen, hdrData, theID, thePath, Quest, Cgi);
+            if (n >= pblen) {retc = -ENAMETOOLONG; return 0;}
+            return pbuff;
+           }
+
+// Objectid must be handled differently as they have not been refalgomized
+//
+   if (*thePath != '/')
+      {if (*path == '/') 
+          {path++;
+           if (*path == '/') theID = "";
+          }
+       if (Police[PolObj] && !P2DST(retc, hBuff, sizeof(hBuff), PolObj,
+                                    path+(*path == '/' ? 1:0))) return 0;
+       n = snprintf(pbuff, pblen, "root://%s%s%s%s", theID, path, Quest, Cgi);
+       if (n >= pblen) {retc = -ENAMETOOLONG; return 0;}
+       return pbuff;
+      }
+
+// Extract out the destination. We need to do this because the front end
+// will have extracted out double slashes and we need to add them back. We
+// also authorize the outgoing connection if we need to in the process.
+//
+   if (!(n = P2DST(retc, hBuff, sizeof(hBuff), PolPath, path))) return 0;
+   path += n;
+
+// Create the new path
+//
+   n = snprintf(pbuff,pblen,"root://%s%s/%s%s%s",theID,hBuff,path,Quest,Cgi);
+
+// Make sure the path will fit
+//
+   if (n > pblen) {retc = -ENAMETOOLONG; return 0;}
+
+// All done
+//
+   return pbuff;
+}
+
+/******************************************************************************/
 /*                                 P 2 U R L                                  */
 /******************************************************************************/
   
@@ -892,6 +1079,10 @@ char *XrdPssSys::P2URL(int &retc, char *pbuff, int pblen,
    const char *fname = path;
    char  idBuff[8], *idP, *retPath;
    char  Apath[MAXPATHLEN*2+1];
+
+// If this is an outgoing proxy then we need to do someother work
+//
+   if (outProxy) return P2OUT(retc, pbuff, pblen, path, Cgi, Ident);
 
 // First, apply the N2N mapping if necessary. If N2N fails then the whole
 // mapping fails and ENAMETOOLONG will be returned.
@@ -906,9 +1097,12 @@ char *XrdPssSys::P2URL(int &retc, char *pbuff, int pblen,
 // If we have an Ident then usethe fd number as the userid. This allows us to
 // have one stream per open connection.
 //
-   if (Ident && (Ident = index(Ident, ':')))
-      {strncpy(idBuff, Ident+1, 7); idBuff[7] = 0;
-       if ((idP = index(idBuff, '@'))) {*(idP+1) = 0; theID = idBuff;}
+   if (Ident)
+      {if (*Ident == '=') theID = Ident+1;
+          else if ((Ident = index(Ident, ':')))
+                  {strncpy(idBuff, Ident+1, 7); idBuff[7] = 0;
+                   if ((idP = index(idBuff, '@'))) {*(idP+1)=0; theID=idBuff;}
+                  }
       }
 
 // Format the header into the buffer and check if we overflowed. Note that there

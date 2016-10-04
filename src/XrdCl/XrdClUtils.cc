@@ -230,7 +230,12 @@ namespace XrdCl
                                          const std::string &path )
   {
     FileSystem   *fs = new FileSystem( URL( server ) );
-    Buffer        arg; arg.FromString( path );
+    // add the 'cks.type' cgi tag in order to
+    // select the proper checksum type in case
+    // the server supports more than one checksum
+    size_t pos = path.find( '?' );
+    std::string cksPath = path + ( pos == std::string::npos ? '?' : '&' ) + "cks.type=" + checkSumType;
+    Buffer        arg; arg.FromString( cksPath );
     Buffer       *cksResponse = 0;
     XRootDStatus  st;
     Log          *log    = DefaultEnv::GetLog();
@@ -255,7 +260,7 @@ namespace XrdCl
       return XRootDStatus( stError, errCheckSumError );
 
     checkSum = elems[0] + ":";
-    checkSum += elems[1];
+    checkSum += NormalizeChecksum( elems[0], elems[1] );
 
     log->Dump( UtilityMsg, "Checksum for %s checksum: %s",
                path.c_str(), checkSum.c_str() );
@@ -291,7 +296,7 @@ namespace XrdCl
     char *cksBuffer = new char[265];
     ckSum.Get( cksBuffer, 256 );
     checkSum  = checkSumType + ":";
-    checkSum += cksBuffer;
+    checkSum += NormalizeChecksum( checkSumType, cksBuffer );
     delete [] cksBuffer;
 
     log->Dump( UtilityMsg, "Checksum for %s is: %s", path.c_str(),
@@ -453,5 +458,35 @@ namespace XrdCl
       keyVals += "'" + it->first + "' = '" + it->second + "', ";
     keyVals.erase( keyVals.length()-2, 2 );
     log->Dump( topic, format, keyVals.c_str() );
+  }
+
+  //----------------------------------------------------------------------------
+  // Print a char array as hex
+  //----------------------------------------------------------------------------
+  std::string Utils::Char2Hex( uint8_t *array, uint16_t size )
+  {
+    char *hex = new char[2*size+1];
+    for( uint16_t i = 0; i < size; ++i )
+      snprintf( hex+(2*i), 3, "%02x", (int)array[i] );
+    std::string result = hex;
+    delete [] hex;
+    return result;
+  }
+
+  //----------------------------------------------------------------------------
+  // Normalize checksum
+  //----------------------------------------------------------------------------
+  std::string Utils::NormalizeChecksum( const std::string &name,
+                                        const std::string &checksum )
+  {
+    if( name == "adler32" || name == "crc32" )
+    {
+      size_t i;
+      for( i = 0; i < checksum.length(); ++i )
+        if( checksum[i] != '0' )
+          break;
+      return checksum.substr(i);
+    }
+    return checksum;
   }
 }

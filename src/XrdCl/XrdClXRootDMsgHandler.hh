@@ -117,6 +117,13 @@ namespace XrdCl
       virtual uint16_t Examine( Message *msg  );
 
       //------------------------------------------------------------------------
+      //! Get handler sid
+      //!
+      //! return sid of the corresponding request, otherwise 0
+      //------------------------------------------------------------------------
+      virtual uint16_t GetSid() const;
+
+      //------------------------------------------------------------------------
       //! Process the message if it was "taken" by the examine action
       //!
       //! @param msg the message to be processed
@@ -324,7 +331,7 @@ namespace XrdCl
       //------------------------------------------------------------------------
       //! Update the "tried=" part of the CGI of the current message
       //------------------------------------------------------------------------
-      void UpdateTriedCGI();
+      void UpdateTriedCGI(uint32_t errNo=0);
 
       //------------------------------------------------------------------------
       //! Switch on the refresh flag for some requests

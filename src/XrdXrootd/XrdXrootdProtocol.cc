@@ -59,6 +59,7 @@ XrdXrootdXPath        XrdXrootdProtocol::XPList;
 XrdSfsFileSystem     *XrdXrootdProtocol::osFS;
 XrdSfsFileSystem     *XrdXrootdProtocol::digFS    = 0;
 char                 *XrdXrootdProtocol::FSLib[2] = {0, 0};
+int                   XrdXrootdProtocol::FSLvn[2] = {0, 0};
 char                 *XrdXrootdProtocol::digLib   = 0;
 char                 *XrdXrootdProtocol::digParm  = 0;
 XrdXrootdFileLock    *XrdXrootdProtocol::Locker;
@@ -71,9 +72,12 @@ XrdSysError           XrdXrootdProtocol::eDest(0, "Xrootd");
 XrdXrootdStats       *XrdXrootdProtocol::SI;
 XrdXrootdJob         *XrdXrootdProtocol::JobCKS   = 0;
 char                 *XrdXrootdProtocol::JobCKT   = 0;
+XrdOucTList          *XrdXrootdProtocol::JobCKTLST= 0;
 XrdOucReqID          *XrdXrootdProtocol::PrepID   = 0;
 
 char                 *XrdXrootdProtocol::Notify = 0;
+const char           *XrdXrootdProtocol::myCName= 0;
+int                   XrdXrootdProtocol::myCNlen= 0;
 int                   XrdXrootdProtocol::hailWait;
 int                   XrdXrootdProtocol::readWait;
 int                   XrdXrootdProtocol::Port;
@@ -82,6 +86,7 @@ int                   XrdXrootdProtocol::WANPort;
 int                   XrdXrootdProtocol::WANWindow;
 char                  XrdXrootdProtocol::isRedir = 0;
 char                  XrdXrootdProtocol::JobLCL  = 0;
+char                  XrdXrootdProtocol::JobCKCGI=0;
 XrdNetSocket         *XrdXrootdProtocol::AdminSock= 0;
 
 int                   XrdXrootdProtocol::hcMax        = 28657; // const for now
@@ -243,8 +248,8 @@ static  struct hs_response
                 kXR_unt32 styp;   // Specified as kXR_int32 in doc!
                } hsresp={0, 0, htonl(8), // isRedir == 'M' -> MetaManager
                          htonl(kXR_PROTOCOLVERSION),
-                         (isRedir ? htonl(kXR_LBalServer)
-                                  : htonl(kXR_DataServer))};
+                         (isRedir ? htonl((unsigned int)kXR_LBalServer)
+                                  : htonl((unsigned int)kXR_DataServer))};
 
 XrdXrootdProtocol *xp;
 int dlen, rc;
@@ -601,16 +606,16 @@ int XrdXrootdProtocol::CheckSum(XrdOucStream *Stream, char **argv, int argc)
    XrdOucErrInfo myInfo("CheckSum");
    int rc, ecode;
 
-// The arguments must have <name> <path> (i.e. argc >= 2)
+// The arguments must have <name> <cstype> <path> (i.e. argc >= 3)
 //
-   if (argc < 2)
+   if (argc < 3)
       {Stream->PutLine("Internal error; not enough checksum args!");
        return 8;
       }
 
 // Issue the checksum calculation (that's all we do here).
 //
-   rc = osFS->chksum(XrdSfsFileSystem::csCalc, JobCKT, argv[1], myInfo);
+   rc = osFS->chksum(XrdSfsFileSystem::csCalc, argv[1], argv[2], myInfo);
 
 // Return result regardless of what it is
 //
@@ -629,6 +634,10 @@ void XrdXrootdProtocol::Cleanup()
 {
    XrdXrootdPio *pioP;
    int i;
+
+// Release any internal monitoring information
+//
+   if (Entity.moninfo) {free(Entity.moninfo); Entity.moninfo = 0;}
 
 // If we have a buffer, release it
 //

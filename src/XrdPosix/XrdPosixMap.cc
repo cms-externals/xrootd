@@ -33,6 +33,7 @@
 
 #include "XProtocol/XProtocol.hh"
 #include "XrdPosix/XrdPosixMap.hh"
+#include "XrdSfs/XrdSfsFlags.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 
 /******************************************************************************/
@@ -45,7 +46,7 @@ bool XrdPosixMap::Debug = false;
 /*                            F l a g s 2 M o d e                             */
 /******************************************************************************/
   
-mode_t XrdPosixMap::Flags2Mode(uint32_t flags)
+mode_t XrdPosixMap::Flags2Mode(dev_t *rdv, uint32_t flags)
 {
    mode_t newflags = 0;
 
@@ -57,8 +58,12 @@ mode_t XrdPosixMap::Flags2Mode(uint32_t flags)
         if (flags & XrdCl::StatInfo::Other)    newflags |= S_IFBLK;
    else if (flags & XrdCl::StatInfo::IsDir)    newflags |= S_IFDIR;
    else                                        newflags |= S_IFREG;
-   if (flags & XrdCl::StatInfo::Offline)       newflags |= S_ISVTX;
-   if (flags & XrdCl::StatInfo::POSCPending)   newflags |= S_ISUID;
+   if (flags & XrdCl::StatInfo::POSCPending)   newflags |= XRDSFS_POSCPEND;
+   if (rdv)
+  {*rdv = 0;
+   if (flags & XrdCl::StatInfo::Offline)       *rdv     |= XRDSFS_OFFLINE;
+   if (flags & XrdCl::StatInfo::BackUpExists)  *rdv     |= XRDSFS_HASBKUP;
+  }
 
    return newflags;
 }
@@ -98,27 +103,6 @@ int XrdPosixMap::mapCode(int rc)
 }
 
 /******************************************************************************/
-/* Private:                     m a p E r r o r                               */
-/******************************************************************************/
-  
-int XrdPosixMap::mapError(int rc)
-{
-    switch(rc)
-       {case kXR_NotFound:      return ENOENT;
-        case kXR_NotAuthorized: return EACCES;
-        case kXR_IOError:       return EIO;
-        case kXR_NoMemory:      return ENOMEM;
-        case kXR_NoSpace:       return ENOSPC;
-        case kXR_ArgTooLong:    return ENAMETOOLONG;
-        case kXR_noserver:      return EHOSTUNREACH;
-        case kXR_NotFile:       return ENOTBLK;
-        case kXR_isDirectory:   return EISDIR;
-        case kXR_FSError:       return ENOSYS;
-        default:                return ECANCELED;
-       }
-}
-
-/******************************************************************************/
 /*                           M o d e 2 A c c e s s                            */
 /******************************************************************************/
   
@@ -144,7 +128,7 @@ XrdCl::Access::Mode XrdPosixMap::Mode2Access(mode_t mode)
   
 int XrdPosixMap::Result(const XrdCl::XRootDStatus &Status)
 {
-   const char *eText;
+   std::string eText;
    int eNum;
 
 // If all went well, return success
@@ -154,16 +138,16 @@ int XrdPosixMap::Result(const XrdCl::XRootDStatus &Status)
 // If this is an xrootd error then get the xrootd generated error
 //
    if (Status.code == XrdCl::errErrorResponse)
-      {eText = Status.GetErrorMessage().c_str();
-       eNum  = mapError(Status.errNo);
+      {eText = Status.GetErrorMessage();
+       eNum  = XProtocol::toErrno(Status.errNo);
       } else {
-       eText = Status.ToStr().c_str();
+       eText = Status.ToStr();
        eNum  = (Status.errNo ? Status.errNo : mapCode(Status.code));
       }
 
 // Trace this if need be
 //
-   if (eNum != ENOENT && eText && *eText && Debug)
+   if (eNum != ENOENT && !eText.empty() && Debug)
       cerr <<"XrdPosix: " <<eText <<endl;
 
 // Return

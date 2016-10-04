@@ -30,6 +30,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <iostream>
+#include <stdio.h>
 #include <sys/time.h>
 #include <sys/param.h>
 #include <sys/resource.h>
@@ -85,7 +87,7 @@ XrdPosixFile::~XrdPosixFile()
 
 // Close the remote connection
 //
-   if (clFile.IsOpen()) clFile.Close();
+   if (clFile.IsOpen()) {XrdCl::XRootDStatus status = clFile.Close();};
 
 // Free the path
 //
@@ -99,10 +101,38 @@ XrdPosixFile::~XrdPosixFile()
 void* XrdPosixFile::DelayedDestroy(void* vpf)
 {
 // Static function.
-// Called within a dedicated thread if XrdOucCacheIO is io-active.
+// Called within a dedicated thread if XrdOucCacheIO is io-active or the
+// file cannot be closed in a clean fashion for some reason.
 
-   XrdPosixFile* pf = (XrdPosixFile*)vpf;
-   delete pf;
+   XrdCl::XRootDStatus Status;
+   int wtCnt = 180, wtChk = 3;
+   XrdPosixFile* fP = (XrdPosixFile*)vpf;
+   const char *eTxt = "unknown";
+
+// Wait for active I/O to complete
+//
+   while(fP->XCio->ioActive() && wtCnt) {sleep(wtChk); wtCnt -= wtChk;}
+
+// If it didn't complete we can't delete this object. Otherwise, try to close
+// it if it is open. This may not be possible if recovery is taking too long.
+//
+   if (!wtCnt) eTxt = "active I/O";
+      else {while(fP->clFile.IsOpen() && wtCnt)
+                 {if (fP->Close(Status)) break;
+                  sleep(wtChk); wtCnt -= wtChk;
+                 }
+            if (wtCnt) eTxt = Status.ToString().c_str();
+           }
+
+// Delete the object if it is safe to do so. Otherwise, issue error message.
+//
+   if (wtCnt) delete fP;
+      else {char eBuff[2048];
+            snprintf(eBuff, sizeof(eBuff),
+                     "PosixFile: %s timeout closing %s; object lost!\n",
+                     eTxt, fP->Path());
+            std::cerr <<eBuff <<std::flush;
+           }
 
    return 0;
 }
@@ -255,7 +285,7 @@ bool XrdPosixFile::Stat(XrdCl::XRootDStatus &Status, bool force)
 
 // Copy over the relevant fields
 //
-   myMode  = XrdPosixMap::Flags2Mode(sInfo->GetFlags());
+   myMode  = XrdPosixMap::Flags2Mode(&myRdev, sInfo->GetFlags());
    myMtime = static_cast<time_t>(sInfo->GetModTime());
    mySize  = static_cast<size_t>(sInfo->GetSize());
    myInode = static_cast<ino_t>(strtoll(sInfo->GetId().c_str(), 0, 10));

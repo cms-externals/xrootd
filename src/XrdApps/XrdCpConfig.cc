@@ -81,7 +81,7 @@ static XrdSysError  eDest(&Logger, "");
 
 XrdSysError  *XrdCpConfig::Log = &XrdCpConfiguration::eDest;
   
-const char   *XrdCpConfig::opLetters = ":C:d:D:fFhHI:NPrRsS:t:T:vVX:y:Z";
+const char   *XrdCpConfig::opLetters = ":C:d:D:fFhHI:NpPrRsS:t:T:vVX:y:Z";
 
 struct option XrdCpConfig::opVec[] =         // For getopt_long()
      {
@@ -94,6 +94,7 @@ struct option XrdCpConfig::opVec[] =         // For getopt_long()
       {OPT_TYPE "infiles",   1, 0, XrdCpConfig::OpIfile},
       {OPT_TYPE "license",   0, 0, XrdCpConfig::OpLicense},
       {OPT_TYPE "nopbar",    0, 0, XrdCpConfig::OpNoPbar},
+      {OPT_TYPE "path",      0, 0, XrdCpConfig::OpPath},
       {OPT_TYPE "posc",      0, 0, XrdCpConfig::OpPosc},
       {OPT_TYPE "proxy",     1, 0, XrdCpConfig::OpProxy},
       {OPT_TYPE "recursive", 0, 0, XrdCpConfig::OpRecurse},
@@ -106,6 +107,7 @@ struct option XrdCpConfig::opVec[] =         // For getopt_long()
       {OPT_TYPE "verbose",   0, 0, XrdCpConfig::OpVerbose},
       {OPT_TYPE "version",   0, 0, XrdCpConfig::OpVersion},
       {OPT_TYPE "xrate",     1, 0, XrdCpConfig::OpXrate},
+      {OPT_TYPE "parallel",  1, 0, XrdCpConfig::OpParallel},
       {0,                    0, 0, 0}
      };
 
@@ -127,6 +129,7 @@ XrdCpConfig::XrdCpConfig(const char *pgm)
    pHost    = 0;
    pPort    = 0;
    xRate    = 0;
+   Parallel = 1;
    OpSpec   = 0;
    Dlvl     = 0;
    nSrcs    = 1;
@@ -207,7 +210,7 @@ void XrdCpConfig::Config(int aCnt, char **aVec, int opts)
 // Process legacy options first before atempting normal options
 //
 do{while(optind < Argc && Legacy(optind)) {}
-   if ((opC = getopt_long(Argc, Argv, opLetters, opVec, &i)) >= 0)
+   if ((opC = getopt_long(Argc, Argv, opLetters, opVec, &i)) != (char)-1)
       switch(opC)
          {case OpCksum:    defCks(optarg);
                            break;
@@ -227,6 +230,8 @@ do{while(optind < Argc && Legacy(optind)) {}
           case OpLicense:  License();
                            break;
           case OpNoPbar:   OpSpec |= DoNoPbar;
+                           break;
+          case OpPath:     OpSpec |= DoPath;
                            break;
           case OpPosc:     OpSpec |= DoPosc;
                            break;
@@ -266,6 +271,9 @@ do{while(optind < Argc && Legacy(optind)) {}
           case OpXrate:    OpSpec |= DoXrate;
                            if (!a2z(optarg, &xRate, 10*1024LL, -1)) Usage(22);
                            break;
+          case OpParallel: OpSpec |= DoParallel;
+                           if (!a2i(optarg, &Parallel, 1, 4)) Usage(22);
+                           break;
           case ':':        UMSG("'" <<OpName() <<"' argument missing.");
                            break;
           case '?':        if (!Legacy(optind-1))
@@ -274,13 +282,13 @@ do{while(optind < Argc && Legacy(optind)) {}
           default:         UMSG("Internal error processing '" <<OpName() <<"'.");
                            break;
          }
-  } while(opC >= 0 && optind < Argc);
+  } while(opC != (char)-1 && optind < Argc);
 
 // Make sure we have the right number of files
 //
-   if (inFile) {if (!parmCnt     ) UMSG("Destination not specified.");}
-      else {    if (!parmCnt     ) UMSG("No files specified.");
-                if ( parmCnt == 1) UMSG("Destination not specified.");
+   if (inFile) {if (!parmCnt      ) UMSG("Destination not specified.");}
+      else {    if (!parmCnt      ) UMSG("No files specified.");
+                if ( parmCnt == 1 ) UMSG("Destination not specified.");
            }
 
 // Check for conflicts wit third party copy
@@ -295,26 +303,33 @@ do{while(optind < Argc && Legacy(optind)) {}
        Verbose = 0;
       }
 
+// Turn on auto-path creation if requested via envar
+//
+   if (getenv("XRD_MAKEPATH")) OpSpec |= DoPath;
+
+   if( parmCnt > 1 )
+   {
 // Process the destination first as it is special
 //
-   dstFile = new XrdCpFile(parmVal[--parmCnt], rc);
-   if (rc) FMSG("Invalid url, '" <<dstFile->Path <<"'.", 22);
+     dstFile = new XrdCpFile(parmVal[--parmCnt], rc);
+     if (rc) FMSG("Invalid url, '" <<dstFile->Path <<"'.", 22);
 
 // Do a protocol check
 //
-   if (dstFile->Protocol != XrdCpFile::isFile
-   &&  dstFile->Protocol != XrdCpFile::isStdIO
-   &&  dstFile->Protocol != XrdCpFile::isXroot)
-      {FMSG(dstFile->ProtName <<"file protocol is not supported.", 22)}
+     if (dstFile->Protocol != XrdCpFile::isFile
+     &&  dstFile->Protocol != XrdCpFile::isStdIO
+     &&  dstFile->Protocol != XrdCpFile::isXroot)
+        {FMSG(dstFile->ProtName <<"file protocol is not supported.", 22)}
 
 // Resolve this file if it is a local file
 //
-   isLcl = (dstFile->Protocol == XrdCpFile::isFile)
-         | (dstFile->Protocol == XrdCpFile::isStdIO);
-   if (isLcl && (rc = dstFile->Resolve()))
-      {if (rc != ENOENT || (Argc - optind - 1) > 1 || OpSpec & DoRecurse)
-          FMSG(strerror(rc) <<" processing " <<dstFile->Path, 2);
-      }
+     isLcl = (dstFile->Protocol == XrdCpFile::isFile)
+           | (dstFile->Protocol == XrdCpFile::isStdIO);
+     if (isLcl && (rc = dstFile->Resolve()))
+        {if (rc != ENOENT || (Argc - optind - 1) > 1 || OpSpec & DoRecurse)
+            FMSG(strerror(rc) <<" processing " <<dstFile->Path, 2);
+        }
+   }
 
 // Now pick up all the source files from the command line
 //
@@ -341,20 +356,21 @@ do{while(optind < Argc && Legacy(optind)) {}
 
 // Check if we have an appropriate destination
 //
-   if (dstFile->Protocol == XrdCpFile::isFile && (numFiles > 1 
+   if (dstFile->Protocol == XrdCpFile::isFile && (numFiles > 1
    ||  (OpSpec & DoRecurse && srcFile->Protocol != XrdCpFile::isFile)))
       FMSG("Destination is neither remote nor a directory.", 2);
 
 // Do the dumb check
 //
-   if (isLcl) FMSG("All files are local; use 'cp' instead!", 1);
+   if (isLcl && Opts & optNoLclCp)
+      FMSG("All files are local; use 'cp' instead!", 1);
 
 // Check for checksum spec conflicts
 //
    if (OpSpec & DoCksum)
       {if (CksData.Length && numFiles > 1)
           FMSG("Checksum with fixed value requires a single input file.", 2);
-       if (OpSpec & DoRecurse)
+       if (CksData.Length && OpSpec & DoRecurse)
           FMSG("Checksum with fixed value conflicts with '--recursive'.", 2);
       }
 
@@ -725,7 +741,7 @@ int XrdCpConfig::Legacy(const char *theOp, const char *theArg)
       return defOpt(theOp, theArg);
 
    if (!strcmp(theOp, "-extreme") || !strcmp(theOp, "-x"))
-      {if (nSrcs <= 1) nSrcs = dfltSrcs;
+      {if (nSrcs <= 1) {nSrcs = dfltSrcs; OpSpec |= DoSources;}
        return 1;
       }
 
@@ -830,9 +846,10 @@ void XrdCpConfig::Usage(int rc)
    static const char *Options= "\n"
    "Options: [--cksum <args>] [--debug <lvl>] [--coerce] [--dynamic-src]\n"
    "         [--force] [--help] [--infiles <fn>] [--license] [--nopbar]\n"
-   "         [--posc] [--proxy <host>:<port>] [--recursive] [--retry <n>]\n"
-   "         [--server] [--silent] [--sources <n>] [--streams <n>]\n"
-   "         [--tpc {first|only}] [--verbose] [--version] [--xrate <rate>]";
+   "         [--path] [--posc] [--proxy <host>:<port>] [--recursive]\n"
+   "         [--retry <n>] [--server] [--silent] [--sources <n>] [--streams <n>]\n"
+   "         [--tpc {first|only}] [--verbose] [--version] [--xrate <rate>]\n"
+   "         [--parallel <n>]";
 
    static const char *Syntax2= "\n"
    "<src>:   [[x]root://<host>[:<port>]/]<path> | -";
@@ -859,6 +876,7 @@ void XrdCpConfig::Usage(int rc)
    "-H | --license      prints license terms and conditions\n"
    "-I | --infiles      specifies the file that contains a list of input files\n"
    "-N | --nopbar       does not print the progress bar\n"
+   "-p | --path         automatically create remote destination path\n"
    "-P | --posc         enables persist on successful close semantics\n"
    "-D | --proxy        uses the specified SOCKS4 proxy connection\n"
    "-r | --recursive    recursively copies all source files\n"
@@ -874,7 +892,8 @@ void XrdCpConfig::Usage(int rc)
    "-v | --verbose      produces more information about the copy\n"
    "-V | --version      prints the version number\n"
    "-X | --xrate <rate> limits the transfer to the specified rate. You can\n"
-   "                    suffix the value with 'k', 'm', or 'g'\n\n"
+   "                    suffix the value with 'k', 'm', or 'g'\n"
+   "     --parallel <n> number of copy jobs to be run simultaneously\n\n"
    "Legacy options:     [-adler] [-DI<var> <val>] [-DS<var> <val>] [-np]\n"
    "                    [-md5] [-OD<cgi>] [-OS<cgi>] [-version] [-x]";
 

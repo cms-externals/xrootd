@@ -28,6 +28,7 @@
 /* specific prior written permission of the institution or contributor.       */
 /******************************************************************************/
 
+#include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
 #include <stdio.h>
@@ -48,6 +49,59 @@
 using namespace std;
   
 /******************************************************************************/
+/*                         L o c a l   S t a t i c s                          */
+/******************************************************************************/
+  
+namespace
+{
+// Selection mask values
+//
+const char hasPub4 = 0x01;
+const char hasPrv4 = 0x02;
+const char hasPub6 = 0x04;
+const char hasPrv6 = 0x08;
+const char hasAny4 = hasPub4 | hasPrv4;
+const char hasAny6 = hasPub6 | hasPrv6;
+const int  hasNum  = 4;
+
+// Name translation table
+//
+const char  sMask[hasNum] = {hasPub4,  hasPrv4,   hasPub6,  hasPrv6};
+const char *sName[hasNum] = {"pub4 ",  "prv4 ",   "pub6 ",  "prv6"};
+
+// common -> Only private addresses may select any node. Public must select
+//           a node that has a public address.
+//
+   const char ifMaskComm [XrdNetIF::ifMax] = {hasPub4,  hasAny4,
+                                              hasPub6,  hasAny6,
+                                              hasPub4 | hasPub6,
+                                              hasAny6 | hasAny4,
+                                              hasPub6 | hasPub4,
+                                              hasAny4 | hasAny6
+                                             };
+
+// local  -> Public-private address is immaterial for node selection.
+//
+   const char ifMaskLocal[XrdNetIF::ifMax] = {hasAny4,  hasAny4,
+                                              hasAny6,  hasAny6,
+                                              hasAny4 | hasAny6,
+                                              hasAny4 | hasAny6,
+                                              hasAny6 | hasAny4,
+                                              hasAny6 | hasAny4
+                                             };
+
+// split  -> Address type may only select node with that address type.
+//
+   const char ifMaskSplit[XrdNetIF::ifMax] = {hasPub4,  hasPrv4,
+                                              hasPub6,  hasPrv6,
+                                              hasPub4 | hasPub6,
+                                              hasPrv4 | hasPrv6,
+                                              hasPub6 | hasPub4,
+                                              hasPrv6 | hasPrv4
+                                             };
+}
+
+/******************************************************************************/
 /*                        S t a t i c   M e m b e r s                         */
 /******************************************************************************/
 
@@ -57,21 +111,86 @@ char             *XrdNetIF::myDomain  = XrdNetIF::SetDomain();
 
 char             *XrdNetIF::ifCfg[2]  = {0,0};
 
+const char       *XrdNetIF::ifTName[ifMax] = {"public IPv4",   // 01
+                                              "private IPv4",  // 02
+                                              "public IPv6",   // 04
+                                              "private IPv6",  // 08
+                                              "public",
+                                              "private",
+                                              "public",
+                                              "private"
+                                             };
+
+
+// The following vector is suitable only for local routing. It is reset
+// to the appropriate selection bits when Routing() is called.
+//
+const char       *XrdNetIF::ifMaskVec = ifMaskLocal;
+
 XrdNetIF::netType XrdNetIF::netRoutes = XrdNetIF::netLocal;
 
 int               XrdNetIF::dfPort    = 1094;
 
 XrdNetIF::ifData  XrdNetIF::ifNull;
 
+bool              XrdNetIF::rPIPA = false;
+
+/******************************************************************************/
+/*                               D i s p l a y                                */
+/******************************************************************************/
+  
+void XrdNetIF::Display(const char *pfx)
+{
+   static const char *ifN[] = {"pub4", "prv4", "pub6", "prv6"};
+   static const char *ifT[] = {"all4", 0,      "all6", 0};
+   static const char *nNM[] = {"local", "split", "common", "local"};
+          const char *iHX[hasNum] = {"", "", "", ""};
+          const char *ifRType, *hName = "";
+   char buff[256];
+   bool nameOK = false;
+
+// If we have no error routing object, just return
+//
+   if (!eDest) return;
+
+// Get a hostname
+//
+   for (int i = 0; i < (int)ifNum; i++)
+       {if (ifName[i] != &ifNull)
+           {hName = ifName[i]->iVal;
+            if (ifxDNS[i]) {nameOK = true; break;}
+           }
+       }
+
+// Compute selection mask
+//
+   for (int i = 0; i < hasNum; i++)
+       if (ifMask & sMask[i]) iHX[i] = sName[i];
+
+// Print results
+//
+   sprintf(buff, ": %s %s%s%s%s", nNM[ifRoute], iHX[0],iHX[1],iHX[2],iHX[3]);
+   eDest->Say(pfx, "Routing for ", hName, buff);
+
+   for (int i = 0; i < (int)ifNum; i++)
+       {if (ifName[i] != &ifNull)
+           {if (ifT[i] && ifDest[i] == ifDest[i+1]) {ifRType = ifT[i]; i++;}
+               else ifRType = ifN[i];
+            sprintf(buff, "Route %s: ", ifRType);
+            eDest->Say(pfx, buff, (nameOK ? hName : ifName[i]->iVal),
+                       " Dest=", ifDest[i]->iVal, portSfx.val);
+           }
+       }
+}
+
 /******************************************************************************/
 /* Private:                     G e n A d d r s                               */
 /******************************************************************************/
   
-bool XrdNetIF::GenAddrs(ifAddrs &ifTab, XrdNetAddrInfo *src,
-                                        const char     *hName, bool isPVT)
+bool XrdNetIF::GenAddrs(ifAddrs &ifTab, XrdNetAddrInfo *src)
 {
    static const int noPort  = XrdNetAddr::noPort;
-   static const int old6M4  = XrdNetAddr::old6Map4;
+   static const int old6M4  = XrdNetAddr::noPort | XrdNetAddr::old6Map4;
    int n;
 
 // If this is an IPV4 address, then format as it
@@ -86,7 +205,7 @@ bool XrdNetIF::GenAddrs(ifAddrs &ifTab, XrdNetAddrInfo *src,
       }
 
 // If this is a mapped address then we can easily generate the IPV4 version
-// and the destination address is the deprecated IPV6 address.
+// and the locate destination address is the deprecated IPV6 address.
 //
    if (src->isMapped())
       {char *Colon;
@@ -100,43 +219,50 @@ bool XrdNetIF::GenAddrs(ifAddrs &ifTab, XrdNetAddrInfo *src,
        return true;
       }
 
-// This is a true IPV6 address, we must check if there is an IPV4 interface.
-// This will only work if we have a host name. We preferentially use IPV4
-// addresses for backward compatability.
-//
-   if (hName)
-      {XrdNetAddr *iP;
-       int i, iN, p = src->Port();
-       bool aOK = true;
-       if (!XrdNetUtils::GetAddrs(hName,&iP,iN,XrdNetUtils::onlyIPv4, p) && iN)
-          {for (i = 0; i < iN; i++) {if (!(isPVT ^ iP[i].isPrivate())) break;}
-           if (i < iN)
-              {if (!(ifTab.hALen = iP[0].Format(ifTab.hAddr,sizeof(ifTab.hAddr),
-                                   XrdNetAddr::fmtAddr, noPort))
-               ||  !(ifTab.hDLen = iP[0].Format(ifTab.hDest,sizeof(ifTab.hDest),
-                                   XrdNetAddr::fmtAdv6, old6M4))) aOK = false;
-               delete [] iP;
-               return aOK;
-              }
-          }
-      }
-
 // There is no IPV4 address so use pure IPV6.
 //
    ifTab.ipV6 = true;
    if (!(ifTab.hALen = src->Format(ifTab.hAddr,  sizeof(ifTab.hAddr),
-                            XrdNetAddr::fmtAddr, noPort))
+                            XrdNetAddr::fmtAdv6, noPort))
    ||  !(ifTab.hDLen = src->Format(ifTab.hDest,  sizeof(ifTab.hDest),
-                            XrdNetAddr::fmtAdv6, old6M4))) return false;
+                            XrdNetAddr::fmtAdv6, noPort))) return false;
    return true;
+}
+
+/******************************************************************************/
+
+bool XrdNetIF::GenAddrs(ifAddrs &ifTab, const char *hName, bool wantV6)
+{
+   XrdNetAddr *iP;
+   XrdNetUtils::AddrOpts aOpts = (wantV6 ? XrdNetUtils::onlyIPv6
+                                         : XrdNetUtils::onlyIPv4);
+   int i, iN, iPVT = -1;
+   bool aOK = false;
+
+// Find alternate addresses in the desired protocol family for this host.
+//
+   if (!XrdNetUtils::GetAddrs(hName, &iP, iN, aOpts, 0) && iN)
+      {for (i = 0; i < iN; i++)
+           {if (iP[i].isPrivate()) iPVT = i;
+               else break;
+           }
+       if (i < iN) ifTab.prvt = false;
+          else if (iPVT >= 0) {i = iPVT; ifTab.prvt = true;}
+       if (i > iN) aOK = GenAddrs(ifTab, &iP[i]);
+       delete [] iP;
+      }
+
+// All done
+//
+   return aOK;
 }
 
 /******************************************************************************/
 /* Private:                        G e n I F                                  */
 /******************************************************************************/
   
-#define ADDSLOT(xdst, xstr, xlen) {strcpy(ifP->iVal,xstr); ifP->iLen=xlen; \
-               xdst=ifP; bP += (6 + xlen + (xlen & 0x01)); ifP = (ifData *)bP;}
+#define ADDSLOT(xdst, xstr, xlen) {strcpy(ifBP->iVal,xstr);ifBP->iLen=xlen; \
+               xdst=ifBP; bP += (6 + xlen + (xlen & 0x01));ifBP = (ifData *)bP;}
 
 #define RLOSLOT(xdst) xdst = (ifData *)(ifBuff+((char *)xdst-buff))
 
@@ -144,86 +270,109 @@ bool XrdNetIF::GenIF(XrdNetAddrInfo **src, int srcnum)
 {
    ifAddrs ifTab;
    const char *hName;
-   char buff[2048], *bP = buff;
-   char hBuff[NI_MAXHOST+16];
-   ifData *ifP = (ifData *)buff;
+   char buff[4096], *bP = buff;
+   ifData *ifBP = (ifData *)buff;
+   ifType ifT;
    int i, n;
-   bool isPrivate, genAOK = true;
+   bool isPrivate;
 
 // Initialize all of the vectors and free the buffer if we allocated it
 //
-   ifName[Public] = ifName[Private] = &ifNull;
-   ifNest[Public] = ifNest[Private] = &ifNull;
-   ifDest[Public] = ifDest[Private] = &ifNull;
+   for (i = 0; i < (int)ifMax; i++)
+      {ifName[i] = ifDest[i] = &ifNull;
+       ifxDNS[i] = false;
+      }
    if (ifBuff) {free(ifBuff); ifBuff = 0;}
 
 for (i = 0; i < srcnum; i++)
 {
-// Expand out the interface names if we actually need to
+
+// Generate interface addresses. Failure here is almost impossible.
 //
    if (!src[i]) continue;
    isPrivate = src[i]->isPrivate();
-   if ((!isPrivate && ifName[Public] != &ifNull)
-   ||  ( isPrivate && ifName[Private]!= &ifNull))
-      {if (eDest && src[i]->Format(hBuff, sizeof(hBuff),
-                                   XrdNetAddr::fmtAddr,XrdNetAddr::noPort))
-          {char eBuff[1024];
-           sprintf(eBuff, "Skipping duplicate %s interface",
-                          (isPrivate ? "private" : "public"));
-           eDest->Emsg("SetIF", eBuff, hBuff);
-          }
-       continue;
-      }
-
-// If this is a public address, get the host name. We avoid reverse lookups for
-// private addresses because most DNS servers will never respond unless it is a
-// private server enabled for the private address space in question. This will
-// always introduce a very long delay which we really don't want to have.
-//
-   if (!isPrivate && (hName = src[i]->Name()))
-      {n = strlen(hName);
-       ADDSLOT(ifName[Public], hName, n);
-       n = snprintf(hBuff, sizeof(hBuff), "%s:%d", hName, src[i]->Port());
-       ADDSLOT(ifNest[Public], hBuff, n);
-       genAOK = GenAddrs(ifTab, src[i], hName, isPrivate);
-      } else genAOK = GenAddrs(ifTab, src[i], 0, isPrivate);
-
-// Check if we should proceed. Failure here is almost unheard of
-//
-   if (!genAOK)
+   if (!GenAddrs(ifTab, src[i]))
       {if (eDest) eDest->Emsg("SetIF", "Unable to validate net interfaces!");
        return false;
       }
 
-// If this is a private interface, then set private pointers to actual addresses
-// since, technically, private addresses should not be registered.
+// Determine interface type
 //
-   if (isPrivate)
-      {ADDSLOT(ifName[Private], ifTab.hAddr, ifTab.hALen);
-       ADDSLOT(ifDest[Private], ifTab.hDest, ifTab.hDLen);
-       ifNest[Private] = ifDest[Private];
-       v6Dest[Private] = ifTab.ipV6;
+   if (isPrivate) ifT = (ifTab.ipV6 ? PrivateV6 : PrivateV4);
+      else        ifT = (ifTab.ipV6 ? PublicV6  : PublicV4);
+
+// We can now check if we have a duplicate interface here
+//
+   if (ifDest[ifT] != &ifNull && eDest)
+      {char eBuff[64];
+       sprintf(eBuff, "Skipping duplicate %s interface",
+                      (isPrivate ? "private" : "public"));
+       eDest->Emsg("SetIF", eBuff, ifTab.hDest);
+       continue;
+      }
+
+// Set the locate destination, always an address
+//
+   ADDSLOT(ifDest[ifT], ifTab.hDest, ifTab.hDLen);
+
+// If this is a private interface, then set private pointers to actual addresses
+// since, technically, private addresses should not be registered. Otherwise,
+// fill in the public interface information. We also set unregistered public
+// addresses (what a pain). Of course, that is a configurable detail.
+//
+   if (!rPIPA && isPrivate)
+      {ADDSLOT(ifName[ifT], ifTab.hAddr, ifTab.hALen);
       } else {
-       if (ifName[Public] == &ifNull)
-          {ADDSLOT(ifName[Public], ifTab.hAddr, ifTab.hALen);}
-       ADDSLOT(ifDest[Public], ifTab.hDest, ifTab.hDLen);
-       if (ifNest[Public] == &ifNull) ifNest[Public] = ifDest[Public];
-       v6Dest[Public] = ifTab.ipV6;
+       if ((hName = src[i]->Name()) && src[i]->isRegistered())
+          {ADDSLOT(ifName[ifT], hName, strlen(hName));
+           ifxDNS[ifT] = true;
+          } else  ifName[ifT]  = ifDest[ifT];
       }
 }
 
+// At this point we have set all of the advertised interfaces. If this is a
+// registered host then we know we have the name and nest information but not
+// necessarily the locate destination for each protocol. So, we will try to
+// find them via DNS. If the host does not have an IPv6 address then we will
+// use the mapped IPv4 address and hope that the client is dual stacked.
+//
+   if (ifDest[PublicV4] == &ifNull && ifxDNS[PublicV6]
+   &&  GenAddrs(ifTab, ifName[PublicV6]->iVal, false))
+      {if (!ifTab.prvt)
+          {ADDSLOT(ifDest[PublicV4], ifTab.hDest, ifTab.hDLen);
+           ifName[PublicV4]  = ifName[PublicV6];
+           ifxDNS[PublicV4]  = ifxDNS[PublicV6];
+          } else if (ifDest[PrivateV4] == &ifNull)
+          {ADDSLOT(ifDest[PrivateV4], ifTab.hDest, ifTab.hDLen);
+           ifName[PrivateV4] = ifName[PublicV6];
+           ifxDNS[PrivateV4] = ifxDNS[PublicV6];
+          }
+      }
+
+   if (ifDest[PublicV6] == &ifNull && ifxDNS[PublicV4]
+   &&  GenAddrs(ifTab, ifName[PublicV4]->iVal, true))
+      {if (!ifTab.prvt)
+          {ADDSLOT(ifDest[PublicV6], ifTab.hDest, ifTab.hDLen);
+           ifName[PublicV6]  = ifName[PublicV4];
+           ifxDNS[PublicV6]  = ifxDNS[PublicV4];
+          } else if (ifDest[PrivateV6] == &ifNull)
+          {ADDSLOT(ifDest[PrivateV6], ifTab.hDest, ifTab.hDLen);
+           ifName[PrivateV6] = ifName[PublicV4];
+           ifxDNS[PrivateV6] = ifxDNS[PublicV4];
+          }
+      }
+
 // Allocate/Replace string storage area
 //
-   n = (char *)ifP - buff;
+   n = (char *)ifBP - buff;
    if (!(ifBuff = (char *)malloc(n))) return false;
    memcpy(ifBuff, buff, n);
 
 // Now relocate all the pointers in the name and dest vectors
 //
-   for (i = 0; i < (int)ifNum; i++)
-       {if (ifName[i] != &ifNull) RLOSLOT(ifName[i]);
-        if (ifNest[i] != &ifNull) RLOSLOT(ifNest[i]);
-        if (ifDest[i] != &ifNull) RLOSLOT(ifDest[i]);
+   for (n = 0; n < (int)ifNum; n++)
+       {if (ifName[n] != &ifNull) RLOSLOT(ifName[n]);
+        if (ifDest[n] != &ifNull) RLOSLOT(ifDest[n]);
        }
 
 // All done
@@ -232,6 +381,28 @@ for (i = 0; i < srcnum; i++)
 }
 
 /******************************************************************************/
+/*                               G e t D e s t                                */
+/******************************************************************************/
+
+int XrdNetIF::GetDest(char *dest, int dlen, ifType ifT, bool prefn)
+{
+   ifType  ifX = (ifT >= ifAny ? static_cast<ifType>(ifAvail) : ifT);
+   ifData *ifP = (prefn && ifxDNS[ifX] ? ifName[ifX] : ifDest[ifX]);
+   int n;
+
+// Compute length and make sure we don't overflow
+//
+   n = ifP->iLen + portSfx.len;
+   if (!(ifP->iLen) || n >= dlen) return 0;
+
+// Return result with port appended
+//
+   strcpy(dest, ifP->iVal);
+   strcpy(dest +ifP->iLen, portSfx.val);
+   return n;
+}
+  
+/******************************************************************************/
 /*                                 G e t I F                                  */
 /******************************************************************************/
 
@@ -239,10 +410,13 @@ for (i = 0; i < srcnum; i++)
 
 int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
 {
+   static const int prvIF[] = {havePrv4, havePrv6};
+   static const int pubIF[] = {havePub4, havePub6};
+
    char ipBuff[256];
-   short ifIdx, sval[4] = {0, 0, 0, 0};
+   short ifIdx = 0, sval[4] = {0, 0, 0, 0};
    short iLen;
-   int   haveIF = 0;
+   int   ifT, haveIF = 0;
 
 #ifdef HAVE_GETIFADDRS
 
@@ -277,8 +451,8 @@ int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
               !(IN6_IS_ADDR_LINKLOCAL(&((sockaddr_in6 *)(ifP->ifa_addr))->sin6_addr)))
              )
             )
-            {if (ifP->ifa_addr->sa_family == AF_INET) haveIF |= haveIPv4;
-                else haveIF |= haveIPv6;
+            {if (ifP->ifa_addr->sa_family == AF_INET){haveIF |= haveIPv4;ifT=0;}
+                else {haveIF |= haveIPv6; ifT = 1;}
              if (ifList)
                 {netAddr.Set(ifP->ifa_addr);
                  if ((iLen = netAddr.Format(ipBuff, sizeof(ipBuff),
@@ -286,12 +460,16 @@ int XrdNetIF::GetIF(XrdOucTList **ifList, const char **eText)
                     {sval[2] = ifIdx;
                      sval[1] = (netAddr.isPrivate() ? 1 : 0);
                      sval[0] = iLen;
+                     haveIF |= (sval[1] ? prvIF[ifT] : pubIF[ifT]);
                      tLP = new XrdOucTList(ipBuff, sval);
                      if (tList) tLast->next = tLP;
                         else    tList       = tLP;
                      tLast = tLP;
                      n++;
                     }
+                } else {
+                 netAddr.Set(ifP->ifa_addr);
+                 haveIF |= (netAddr.isPrivate() ? prvIF[ifT] : pubIF[ifT]);
                 }
             }
           ifP = ifP->ifa_next;
@@ -445,8 +623,7 @@ bool XrdNetIF::IsOkName(const char *ifn, short &ifIdx)
 
 int XrdNetIF::Port(int pnum)
 {
-   int i, n, prevport = ifPort;
-   char *Colon, pBuff[8];
+   int prevport = ifPort;
 
 // Check if anything is really changing
 //
@@ -455,21 +632,8 @@ int XrdNetIF::Port(int pnum)
 
 // Format the port number (can't be more than 5 characters)
 //
-   n = sprintf(pBuff, "%d", pnum);
+   portSfx.len = sprintf(portSfx.val, ":%d", pnum);
    ifPort = pnum;
-
-// Insert the port number if all the buffers that have one. There is room.
-//
-   for (i = 0; i < (int)ifNum; i++)
-       {if (ifNest[i] != &ifNull && (Colon = rindex(ifNest[i]->iVal, ':')))
-           {strcpy(Colon+1, pBuff);
-            ifNest[i]->iLen = (Colon - ifNest[i]->iVal) + n + 1;
-           }
-        if (ifDest[i] != &ifNull && (Colon = rindex(ifDest[i]->iVal, ':')))
-           {strcpy(Colon+1, pBuff);
-            ifDest[i]->iLen = (Colon - ifDest[i]->iVal) + n + 1;
-           }
-       }
 
 // All done
 //
@@ -477,12 +641,27 @@ int XrdNetIF::Port(int pnum)
 }
   
 /******************************************************************************/
+/*                           P o r t D e f a u l t                            */
+/******************************************************************************/
+
+void XrdNetIF::PortDefault(int pnum) {dfPort = pnum;}
+  
+/******************************************************************************/
 /*                               R o u t i n g                                */
 /******************************************************************************/
   
 void XrdNetIF::Routing(XrdNetIF::netType nettype)
 {
-   netRoutes = (nettype == netDefault ? netSplit : nettype);
+
+// Set the routing type
+//
+   netRoutes = (nettype == netDefault ? netLocal : nettype);
+
+// Based on the routing we need to set the appropriate selection mask vector
+//
+        if (netRoutes == netLocal) ifMaskVec = ifMaskLocal;
+   else if (netRoutes == netSplit) ifMaskVec = ifMaskSplit;
+   else                            ifMaskVec = ifMaskComm;
 }
 
 /******************************************************************************/
@@ -508,39 +687,48 @@ char *XrdNetIF::SetDomain()
 /*                                 S e t I F                                  */
 /******************************************************************************/
   
-bool XrdNetIF::SetIF(XrdNetAddrInfo *src, const char *ifList, netType nettype)
+bool XrdNetIF::SetIF(XrdNetAddrInfo *src, const char *ifList, int port,
+                     netType nettype)
 {
-   XrdNetAddrInfo *netIF[2] = {0,0};
-   XrdNetAddr      netAdr[2];
+   XrdNetAddrInfo *netIF[4] = {0,0,0,0}; //pub 0:v4, prv 1:v4 pub 2:v6 prv 3:v6
+   XrdNetAddr      netAdr[4];
    const char *ifErr = 0, *ifBeg = ifList, *ifEnd, *ifAdr, *ifBad = 0;
    int i, n, ifCnt = 1;
    char abuff[64];
 
+// Setup the port number (this sets ifPort)
+//
+   if (port >= 0) Port((port ? port : dfPort));
+
+// Set routing mode for this interface
+//
+   ifRoute = static_cast<short>(nettype == netDefault ? netRoutes : nettype);
+
 // If no list is supplied then fill out based on the source address
 //
-   if (!(ifPort = src->Port())) ifPort = dfPort;
    if (!ifList || !(*ifList))
       {XrdNetAddrInfo *ifVec[8];
        XrdNetAddr *iP;
        const char *hName = src->Name();
        ifCnt = 0;
        if (!hName
-       ||  XrdNetUtils::GetAddrs(hName, &iP, ifCnt, XrdNetUtils::allIPv64,
-                                 ifPort) || !ifCnt) return GenIF(&src, 1);
+       ||  XrdNetUtils::GetAddrs(hName,&iP,ifCnt,XrdNetUtils::allIPv64,ifPort)
+       || !ifCnt) return SetIF64(GenIF(&src, 1));
        if (ifCnt > 8) ifCnt = 8;
        for (i = 0; i < ifCnt; i++) ifVec[i] = &iP[i];
        bool aOK = GenIF(ifVec, ifCnt);
        delete [] iP;
-       return aOK;
+       return SetIF64(aOK);
       }
 
 // Prefrentially use the connect address as the primary interface. This
 // avoids using reported interfaces that may have strange routing.
 //
-   if (src->isPrivate()) {if (!netIF[1]) netIF[1] = src;}
-      else               {if (!netIF[0]) netIF[0] = src;}
+   i = (src->isIPType(XrdNetAddrInfo::IPv4) || src->isMapped() ? 0 : 2);
+   if (src->isPrivate()) i |= 1;
+   netIF[i] = src;
 
-// Process the iflist (up to two interfaces)
+// Process the iflist (up to four interfaces)
 //
    if (ifList && *ifList)
    do {while (*ifBeg && *ifBeg == ' ') ifBeg++;
@@ -559,37 +747,15 @@ bool XrdNetIF::SetIF(XrdNetAddrInfo *src, const char *ifList, netType nettype)
               }
            continue;
           }
-       i = (netAdr[ifCnt].isPrivate() ? 1 : 0);
-       if (!netIF[i] || (netAdr[ifCnt].isIPType(XrdNetAddrInfo::IPv4)
-                         &&  netIF[i]->isIPType(XrdNetAddrInfo::IPv6)))
-          netIF[i] = &netAdr[ifCnt--];
+       i = (netAdr[ifCnt].isIPType(XrdNetAddrInfo::IPv4) ||
+            netAdr[ifCnt].isMapped() ? 0 : 2);
+       if (netAdr[ifCnt].isPrivate()) i |= 1;
+       if (!netIF[i]) netIF[i] = &netAdr[ifCnt--];
       } while(ifCnt >= 0);
 
 // Set the interface data
 //
-   if (!GenIF(netIF, 2)) return false;
-
-// Establish how undefined interfaces will be resolved
-//
-   if (nettype == netDefault) nettype = netRoutes;
-   if (nettype == netSplit)   return true;
-
-// Now set all undefined private interfaces for common and local network routing
-//
-   if (ifName[Private] == &ifNull) ifName[Private] = ifName[Public];
-   if (ifNest[Private] == &ifNull) ifNest[Private] = ifNest[Public];
-   if (ifDest[Private] == &ifNull) ifDest[Private] = ifDest[Public];
-
-// If this is a common network then we are done
-//
-   if (nettype == netCommon) return true;
-
-// Now set all undefined public  interfaces for local network routing
-//
-   if (ifName[Public ] == &ifNull) ifName[Public ] = ifName[Private];
-   if (ifNest[Public ] == &ifNull) ifNest[Public ] = ifNest[Private];
-   if (ifDest[Public ] == &ifNull) ifDest[Public ] = ifDest[Private];
-   return true;
+   return SetIF64(GenIF(netIF, 4));
 }
 
 /******************************************************************************/
@@ -600,11 +766,13 @@ bool XrdNetIF::SetIFNames(char *ifnames)
 {
    char *comma;
 
-// Make sure there are two interface names
+// Parse the interface names
 //
-   if (!(comma = index(ifnames, ',')) || comma == ifnames || !(*(comma+1)))
-      {if (eDest) eDest->Say("Config","Invalid interface name list - ",ifnames);
-       return false;
+   if ((comma = index(ifnames, ',')))
+      {if (comma == ifnames || !(*(comma+1)))
+          {if (eDest) eDest->Say("Config","Invalid interface name - ",ifnames);
+           return false;
+          }
       }
 
 // Free old names, if any
@@ -614,13 +782,101 @@ bool XrdNetIF::SetIFNames(char *ifnames)
 
 // Copy the new names
 //
-   *comma = 0;
+   if (comma)
+      {*comma = 0;
+       ifCfg[1] = (strcmp(ifnames, comma+1) ? strdup(comma+1) : 0);
+       *comma = ',';
+      } else ifCfg[1] = 0;
    ifCfg[0] = strdup(ifnames);
-   ifCfg[1] = (strcmp(ifnames, comma+1) ? strdup(comma+1) : 0);
-   *comma = ',';
    return true;
 }
 
+/******************************************************************************/
+/* Private:                      S e t I F P P                                */
+/******************************************************************************/
+  
+void XrdNetIF::SetIFPP()
+{
+   int i, j;
+
+// For split network we use what we have
+//
+   if (netSplit == (netType)ifRoute) return;
+
+// Now set all undefined private interfaces for common and local network routing
+//
+   i = (int)PrivateV4; j = PublicV4;
+   do {if (ifName[i] == &ifNull) {ifName[i]=ifName[j]; ifxDNS[i]=ifxDNS[j];}
+       if (ifDest[i] == &ifNull)  ifDest[i]=ifDest[j];
+       if (i == (int)PrivateV6) break;
+       i = (int)PrivateV6; j = (int)PublicV6;
+      } while(true);
+
+// If this is a common network then we are done
+//
+   if (netCommon == (netType)ifRoute) return;
+
+// Now set all undefined public  interfaces for local network routing
+//
+   i = (int)PublicV4; j = PrivateV4;
+   do {if (ifName[i] == &ifNull) {ifName[i]=ifName[j]; ifxDNS[i]=ifxDNS[j];}
+       if (ifDest[i] == &ifNull)  ifDest[i]=ifDest[j];
+       if (i == (int)PublicV6) break;
+       i = (int)PublicV6; j = (int)PrivateV6;
+      } while(true);
+}
+
+/******************************************************************************/
+/* Private:                      S e t I F 6 4                                */
+/******************************************************************************/
+  
+bool XrdNetIF::SetIF64(bool retVal)
+{
+   static const  int ifN46= 4;
+   static ifType ifSet[ifN46] = {Public46, Private46, Public64, Private64};
+   static ifType ifChk[ifN46] = {PublicV4, PrivateV4, PublicV6, PrivateV6};
+   static ifType eqSel[ifN46] = {PublicV6, PrivateV6, PublicV4, PrivateV4};
+   static ifType neSel[ifN46] = {PublicV4, PrivateV4, PublicV6, PrivateV6};
+
+// Readjust routing tables if this is not a split network
+//
+   if (netSplit != (netType)ifRoute) SetIFPP();
+
+// Fill out the 4/6 6/4 tables and compute the selection mask
+//
+   ifMask = 0;
+   for (int i = 0; i < ifN46; i++)
+      {ifName[ifSet[i]] = (ifName[ifChk[i]] == &ifNull ? ifName[eqSel[i]]
+                                                       : ifName[neSel[i]]);
+       ifDest[ifSet[i]] = (ifDest[ifChk[i]] == &ifNull ? ifDest[eqSel[i]]
+                                                       : ifDest[neSel[i]]);
+       ifxDNS[ifSet[i]] = ifName[ifSet[i]] != &ifNull &&
+                          isalpha(*(ifName[ifSet[i]]->iVal));
+       if (ifDest[ifChk[i]] != &ifNull)  ifMask |= sMask[i];
+      }
+
+// Record the one that is actually present
+//
+   if (ifName[Public64] != &ifNull) ifAvail = static_cast<char>(Public64);
+      else                          ifAvail = static_cast<char>(Private64);
+
+// Return wha the caller wants us to return
+//
+   return retVal;
+}
+
+/******************************************************************************/
+/*                               S e t M s g s                                */
+/******************************************************************************/
+
+void XrdNetIF::SetMsgs(XrdSysError *erp) {eDest = erp;}
+  
+/******************************************************************************/
+/*                              S e t R P I P A                               */
+/******************************************************************************/
+
+void XrdNetIF::SetRPIPA(bool rval) {rPIPA = rval;}
+  
 /******************************************************************************/
 /* Private:                  V 4 L i n k L o c a l                            */
 /******************************************************************************/

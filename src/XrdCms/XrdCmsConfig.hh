@@ -48,7 +48,6 @@ class XrdOucName2Name;
 class XrdOucProg;
 class XrdOucStream;
 class XrdCmsAdmin;
-class XrdCmsXmi;
 
 struct XrdVersionInfo;
 
@@ -70,6 +69,7 @@ int   asSolo()    {return isSolo;}
 
 int         LUPDelay;     // Maximum delay at look-up
 int         LUPHold;      // Maximum hold  at look-up (in millisconds)
+int         DELDelay;     // Maximum delay for deleting an offline server
 int         DRPDelay;     // Maximum delay for dropping an offline server
 int         PSDelay;      // Maximum delay time before peer is selected
 int         RWDelay;      // R/W lookup delay handling (0 | 1 | 2)
@@ -104,7 +104,8 @@ int         P_mem;        // % MEM Capacity in load factor
 int         P_pag;        // % PAG Capacity in load factor
 
 char        DoMWChk;      // When true (default) perform multiple write check
-char        Rsvd[3];      // Reserved for alignment
+char        DoHnTry;      // When true (default) use hostnames for try redirs
+char        Rsvd[2];      // Reserved for alignment
 
 int         DiskMin;      // Minimum MB needed of space in a partition
 int         DiskHWM;      // Minimum MB needed of space to requalify
@@ -116,7 +117,10 @@ int         DiskWT;       // Seconds to defer client while waiting for space
 int         DiskSS;       // This is a staging server
 int         DiskOK;       // This configuration has data
 
-int         sched_RR;     // 1 -> Simply do round robin scheduling
+char        sched_RR;     // 1 -> Simply do round robin scheduling
+char        sched_Pack;   // 1 -> Pick oldest node (>1 same but wait for resps)
+char        sched_Level;  // 1 -> Use load-based level for "pack" selection
+char        sched_Force;  // 1 -> Client cannot select mode
 int         doWait;       // 1 -> Wait for a data end-point
 
 int         adsPort;      // Alternate server port
@@ -146,9 +150,12 @@ const char  *myDomain;
 const char  *myInsName;
 const char  *myInstance;
 const char  *mySID;
+const char  *mySite;
+      char  *cidTag;
 const char  *ifList;
 XrdOucTList *ManList;     // From manager directive
 XrdOucTList *NanList;     // From manager directive (managers only)
+XrdOucTList *SanList;     // From subcluster directive (managers only)
 
 XrdOss      *ossFS;       // The filsesystem interface
 XrdOucProg  *ProgCH;      // Server only chmod
@@ -188,13 +195,13 @@ int  PidFile(void);
 int  setupManager(void);
 int  setupServer(void);
 char *setupSid();
-int  setupXmi(void);
 void Usage(int rc);
 int  xapath(XrdSysError *edest, XrdOucStream &CFile);
 int  xallow(XrdSysError *edest, XrdOucStream &CFile);
 int  xaltds(XrdSysError *edest, XrdOucStream &CFile);
 int  Fsysadd(XrdSysError *edest, int chk, char *fn);
-int  xblk(XrdSysError *edest, XrdOucStream &CFile);
+int  xblk(XrdSysError *edest, XrdOucStream &CFile, bool iswl=false);
+int  xcid(XrdSysError *edest, XrdOucStream &CFile);
 int  xdelay(XrdSysError *edest, XrdOucStream &CFile);
 int  xdefs(XrdSysError *edest, XrdOucStream &CFile);
 int  xdfs(XrdSysError *edest, XrdOucStream &CFile);
@@ -214,10 +221,11 @@ int  xreps(XrdSysError *edest, XrdOucStream &CFile);
 int  xrmtrt(XrdSysError *edest, XrdOucStream &CFile);
 int  xrole(XrdSysError *edest, XrdOucStream &CFile);
 int  xsched(XrdSysError *edest, XrdOucStream &CFile);
+int  xschedm(char *val, XrdSysError *eDest, XrdOucStream &CFile);
 int  xsecl(XrdSysError *edest, XrdOucStream &CFile);
 int  xspace(XrdSysError *edest, XrdOucStream &CFile);
+int  xsubc(XrdSysError *edest, XrdOucStream &CFile);
 int  xtrace(XrdSysError *edest, XrdOucStream &CFile);
-int  xxmi(XrdSysError *edest, XrdOucStream &CFile);
 
 XrdInet          *NetTCPr;     // Network for supervisors
 char             *AdminPath;
@@ -227,8 +235,6 @@ char             *ConfigFN;
 char            **inArgv;
 int               inArgc;
 char             *SecLib;
-char             *XmiPath;
-char             *XmiParms;
 char             *blkList;
 int               blkChk;
 int               isManager;
@@ -248,16 +254,5 @@ namespace XrdCms
 extern XrdCmsAdmin   Admin;
 extern XrdCmsConfig  Config;
 extern XrdScheduler *Sched;
-extern XrdCmsXmi    *Xmi_Chmod;
-extern XrdCmsXmi    *Xmi_Load;
-extern XrdCmsXmi    *Xmi_Mkdir;
-extern XrdCmsXmi    *Xmi_Mkpath;
-extern XrdCmsXmi    *Xmi_Prep;
-extern XrdCmsXmi    *Xmi_Rename;
-extern XrdCmsXmi    *Xmi_Remdir;
-extern XrdCmsXmi    *Xmi_Remove;
-extern XrdCmsXmi    *Xmi_Select;
-extern XrdCmsXmi    *Xmi_Space;
-extern XrdCmsXmi    *Xmi_Stat;
 }
 #endif

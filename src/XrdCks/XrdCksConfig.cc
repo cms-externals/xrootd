@@ -41,6 +41,8 @@
 #include "XrdCks/XrdCksData.hh"
 #include "XrdCks/XrdCksConfig.hh"
 #include "XrdCks/XrdCksManager.hh"
+#include "XrdCks/XrdCksManOss.hh"
+#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysPlugin.hh"
@@ -67,9 +69,9 @@ XrdCksConfig::XrdCksConfig(const char *cFN, XrdSysError *Eroute, int &aOK,
 /*                             C o n f i g u r e                              */
 /******************************************************************************/
   
-XrdCks *XrdCksConfig::Configure(const char *dfltCalc, int rdsz)
+XrdCks *XrdCksConfig::Configure(const char *dfltCalc, int rdsz, XrdOss *ossP)
 {
-   XrdCks *myCks = getCks(rdsz);
+   XrdCks *myCks = getCks(ossP, rdsz);
    XrdOucTList *tP = CksList;
    int NoGo = 0;
 
@@ -95,27 +97,32 @@ XrdCks *XrdCksConfig::Configure(const char *dfltCalc, int rdsz)
 /*                                g e t C k s                                 */
 /******************************************************************************/
 
-XrdCks *XrdCksConfig::getCks(int rdsz)
+XrdCks *XrdCksConfig::getCks(XrdOss *ossP, int rdsz)
 {
-   XrdSysPlugin  *myLib;
-   XrdCks       *(*ep)(XRDCKSINITPARMS);
+   XrdOucPinLoader *myLib;
+   XrdCks          *(*ep)(XRDCKSINITPARMS);
 
 // Authorization comes from the library or we use the default
 //
-   if (!CksLib) return (XrdCks *)new XrdCksManager(eDest, rdsz, myVersion);
+   if (!CksLib)
+      {if (ossP) return (XrdCks *)new XrdCksManOss (ossP,eDest,rdsz,myVersion);
+          else   return (XrdCks *)new XrdCksManager(     eDest,rdsz,myVersion);
+      }
 
 // Create a plugin object (we will throw this away without deletion because
 // the library must stay open but we never want to reference it again).
 //
-   if (!(myLib = new XrdSysPlugin(eDest,CksLib,"ckslib",&myVersion))) return 0;
+   if (!(myLib = new XrdOucPinLoader(eDest, &myVersion, "ckslib", CksLib)))
+      return 0;
 
 // Now get the entry point of the object creator
 //
-   ep = (XrdCks *(*)(XRDCKSINITPARMS))(myLib->getPlugin("XrdCksInit"));
-   if (!ep) return 0;
+   ep = (XrdCks *(*)(XRDCKSINITPARMS))(myLib->Resolve("XrdCksInit"));
+   if (!ep) {myLib->Unload(true); return 0;}
 
 // Get the Object now
 //
+   delete myLib;
    return ep(eDest, cfgFN, CksParm);
 }
   

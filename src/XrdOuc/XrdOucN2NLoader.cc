@@ -31,6 +31,7 @@
 #include "XrdVersion.hh"
 #include "XrdOuc/XrdOucEnv.hh"
 #include "XrdOuc/XrdOucN2NLoader.hh"
+#include "XrdOuc/XrdOucPinLoader.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysPlugin.hh"
 
@@ -39,11 +40,14 @@
 /******************************************************************************/
   
 XrdOucName2Name *XrdOucN2NLoader::Load(const char     *libName,
-                                       XrdVersionInfo &urVer)
+                                       XrdVersionInfo &urVer,
+                                       XrdOucEnv      *envP)
 {
-   XrdSysPlugin     myLib(eRoute, libName, "namelib", &urVer);
+   extern XrdOucName2NameVec *XrdOucN2NVec_P;
    XrdOucName2Name *(*ep)(XrdOucgetName2NameArgs);
    static XrdVERSIONINFODEF (myVer, XrdN2N, XrdVNUMBER, XrdVERSION);
+   XrdOucName2Name    *n2nP;
+   XrdOucName2NameVec *n2nV;
 
 // Use the default mapping if there is no library. Verify version numbers
 // as we are normally in a different shared library.
@@ -52,7 +56,10 @@ XrdOucName2Name *XrdOucN2NLoader::Load(const char     *libName,
       {if (!XrdSysPlugin::VerCmp(urVer, myVer)) return 0;
        if (lclRoot) XrdOucEnv::Export("XRDLCLROOT", lclRoot);
        if (rmtRoot) XrdOucEnv::Export("XRDRMTROOT", rmtRoot);
-       return XrdOucgetName2Name(eRoute, cFN, libParms, lclRoot, rmtRoot);
+       n2nP = XrdOucgetName2Name(eRoute, cFN, libParms, lclRoot, rmtRoot);
+       if (XrdOucN2NVec_P && envP)
+          envP->PutPtr("XrdOucName2NameVec*", XrdOucN2NVec_P);
+       return n2nP;
       } else {
        XrdOucEnv::Export("XRDN2NLIB", libName);
        if (libParms) XrdOucEnv::Export("XRDN2NPARMS", libParms);
@@ -60,11 +67,15 @@ XrdOucName2Name *XrdOucN2NLoader::Load(const char     *libName,
 
 // Get the entry point of the object creator
 // 
-   ep = (XrdOucName2Name *(*)(XrdOucgetName2NameArgs))(myLib.getPlugin("XrdOucgetName2Name"));
+   XrdOucPinLoader  myLib(eRoute, &urVer, "namelib", libName);
+   ep = (XrdOucName2Name *(*)(XrdOucgetName2NameArgs))(myLib.Resolve("XrdOucgetName2Name"));
    if (!ep) return 0;
-   myLib.Persist();
 
 // Get the Object now
 // 
-   return ep(eRoute, cFN, libParms, lclRoot, rmtRoot);
+   if ((n2nP = ep(eRoute, cFN, libParms, lclRoot, rmtRoot)) && envP)
+      {n2nV = (XrdOucName2NameVec *)myLib.Resolve("?Name2NameVec");
+       if (n2nV) envP->PutPtr("XrdOucName2NameVec*", n2nV);
+      }
+   return n2nP;
 }

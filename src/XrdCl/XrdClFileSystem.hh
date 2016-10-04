@@ -28,6 +28,7 @@
 #include "XrdCl/XrdClURL.hh"
 #include "XrdCl/XrdClStatus.hh"
 #include "XrdOuc/XrdOucEnum.hh"
+#include "XrdOuc/XrdOucCompiler.hh"
 #include "XrdCl/XrdClXRootDResponses.hh"
 #include "XrdSys/XrdSysPthread.hh"
 #include "XProtocol/XProtocol.hh"
@@ -75,9 +76,12 @@ namespace XrdCl
     enum Flags
     {
       None     = 0,              //!< Nothing
+      Compress = kXR_compress,   //!< Read compressed data for open (ignored),
+                                 //!< for kXR_locate return unique hosts
       Delete   = kXR_delete,     //!< Open a new file, deleting any existing
                                  //!< file
-      Force    = kXR_force,      //!< Ignore file usage rules
+      Force    = kXR_force,      //!< Ignore file usage rules, for kXR_locate
+                                 //!< it means ignoreing network dependencies
       MakePath = kXR_mkpath,     //!< Create directory path if it does not
                                  //!< already exist
       New      = kXR_new,        //!< Open the file only if it does not already
@@ -215,7 +219,8 @@ namespace XrdCl
       XRootDStatus Locate( const std::string &path,
                            OpenFlags::Flags   flags,
                            ResponseHandler   *handler,
-                           uint16_t           timeout = 0 );
+                           uint16_t           timeout = 0 )
+                           XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Locate a file - sync
@@ -230,7 +235,8 @@ namespace XrdCl
       XRootDStatus Locate( const std::string  &path,
                            OpenFlags::Flags    flags,
                            LocationInfo      *&response,
-                           uint16_t            timeout  = 0 );
+                           uint16_t            timeout  = 0 )
+                           XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Locate a file, recursively locate all disk servers - async
@@ -247,7 +253,8 @@ namespace XrdCl
       XRootDStatus DeepLocate( const std::string &path,
                                OpenFlags::Flags   flags,
                                ResponseHandler   *handler,
-                               uint16_t           timeout = 0 );
+                               uint16_t           timeout = 0 )
+                               XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Locate a file, recursively locate all disk servers - sync
@@ -262,7 +269,8 @@ namespace XrdCl
       XRootDStatus DeepLocate( const std::string  &path,
                                OpenFlags::Flags   flags,
                                LocationInfo      *&response,
-                               uint16_t            timeout  = 0 );
+                               uint16_t            timeout  = 0 )
+                               XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Move a directory or a file - async
@@ -277,7 +285,8 @@ namespace XrdCl
       XRootDStatus Mv( const std::string &source,
                        const std::string &dest,
                        ResponseHandler   *handler,
-                       uint16_t           timeout = 0 );
+                       uint16_t           timeout = 0 )
+                       XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Move a directory or a file - sync
@@ -290,7 +299,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus Mv( const std::string &source,
                        const std::string &dest,
-                       uint16_t           timeout = 0 );
+                       uint16_t           timeout = 0 )
+                       XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain server information - async
@@ -307,7 +317,8 @@ namespace XrdCl
       XRootDStatus Query( QueryCode::Code  queryCode,
                           const Buffer    &arg,
                           ResponseHandler *handler,
-                          uint16_t         timeout = 0 );
+                          uint16_t         timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain server information - sync
@@ -322,7 +333,8 @@ namespace XrdCl
       XRootDStatus Query( QueryCode::Code   queryCode,
                           const Buffer     &arg,
                           Buffer          *&response,
-                          uint16_t          timeout = 0 );
+                          uint16_t          timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Truncate a file - async
@@ -337,7 +349,8 @@ namespace XrdCl
       XRootDStatus Truncate( const std::string &path,
                              uint64_t           size,
                              ResponseHandler   *handler,
-                             uint16_t           timeout = 0 );
+                             uint16_t           timeout = 0 )
+                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Truncate a file - sync
@@ -350,7 +363,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus Truncate( const std::string &path,
                              uint64_t           size,
-                             uint16_t           timeout = 0 );
+                             uint16_t           timeout = 0 )
+                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Remove a file - async
@@ -363,7 +377,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus Rm( const std::string &path,
                        ResponseHandler   *handler,
-                       uint16_t           timeout = 0 );
+                       uint16_t           timeout = 0 )
+                       XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Remove a file - sync
@@ -374,7 +389,8 @@ namespace XrdCl
       //! @return         status of the operation
       //------------------------------------------------------------------------
       XRootDStatus Rm( const std::string &path,
-                       uint16_t           timeout = 0 );
+                       uint16_t           timeout = 0 )
+                       XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Create a directory - async
@@ -391,7 +407,8 @@ namespace XrdCl
                           MkDirFlags::Flags  flags,
                           Access::Mode       mode,
                           ResponseHandler   *handler,
-                          uint16_t           timeout = 0 );
+                          uint16_t           timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Create a directory - sync
@@ -406,7 +423,8 @@ namespace XrdCl
       XRootDStatus MkDir( const std::string &path,
                           MkDirFlags::Flags  flags,
                           Access::Mode       mode,
-                          uint16_t           timeout = 0 );
+                          uint16_t           timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Remove a directory - async
@@ -419,7 +437,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus RmDir( const std::string &path,
                           ResponseHandler   *handler,
-                          uint16_t           timeout = 0 );
+                          uint16_t           timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Remove a directory - sync
@@ -430,7 +449,8 @@ namespace XrdCl
       //! @return         status of the operation
       //------------------------------------------------------------------------
       XRootDStatus RmDir( const std::string &path,
-                          uint16_t           timeout = 0 );
+                          uint16_t           timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Change access mode on a directory or a file - async
@@ -445,7 +465,8 @@ namespace XrdCl
       XRootDStatus ChMod( const std::string &path,
                           Access::Mode       mode,
                           ResponseHandler   *handler,
-                          uint16_t           timeout = 0 );
+                          uint16_t           timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Change access mode on a directory or a file - sync
@@ -458,7 +479,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus ChMod( const std::string &path,
                           Access::Mode       mode,
-                          uint16_t           timeout = 0 );
+                          uint16_t           timeout = 0 )
+                          XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Check if the server is alive - async
@@ -469,7 +491,8 @@ namespace XrdCl
       //! @return         status of the operation
       //------------------------------------------------------------------------
       XRootDStatus Ping( ResponseHandler *handler,
-                         uint16_t         timeout = 0 );
+                         uint16_t         timeout = 0 )
+                         XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Check if the server is alive - sync
@@ -478,7 +501,7 @@ namespace XrdCl
       //!                 be used
       //! @return         status of the operation
       //------------------------------------------------------------------------
-      XRootDStatus Ping( uint16_t timeout = 0 );
+      XRootDStatus Ping( uint16_t timeout = 0 ) XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain status information for a path - async
@@ -493,20 +516,23 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus Stat( const std::string &path,
                          ResponseHandler   *handler,
-                         uint16_t           timeout = 0 );
+                         uint16_t           timeout = 0 )
+                         XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain status information for a path - sync
       //!
       //! @param path     file/directory path
-      //! @param response the response (to be deleted by the user)
+      //! @param response the response (to be deleted by the user only if the
+      //!                 procedure is successful)
       //! @param timeout  timeout value, if 0 the environment default will
       //!                 be used
       //! @return         status of the operation
       //------------------------------------------------------------------------
       XRootDStatus Stat( const std::string  &path,
                          StatInfo          *&response,
-                         uint16_t            timeout = 0 );
+                         uint16_t            timeout = 0 )
+                         XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain status information for a Virtual File System - async
@@ -521,7 +547,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus StatVFS( const std::string &path,
                             ResponseHandler   *handler,
-                            uint16_t           timeout = 0 );
+                            uint16_t           timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain status information for a Virtual File System - sync
@@ -534,7 +561,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus StatVFS( const std::string  &path,
                             StatInfoVFS       *&response,
-                            uint16_t            timeout = 0 );
+                            uint16_t            timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain server protocol information - async
@@ -547,7 +575,8 @@ namespace XrdCl
       //! @return        status of the operation
       //------------------------------------------------------------------------
       XRootDStatus Protocol( ResponseHandler *handler,
-                             uint16_t         timeout = 0 );
+                             uint16_t         timeout = 0 )
+                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Obtain server protocol information - sync
@@ -558,7 +587,8 @@ namespace XrdCl
       //! @return         status of the operation
       //------------------------------------------------------------------------
       XRootDStatus Protocol( ProtocolInfo *&response,
-                             uint16_t       timeout = 0 );
+                             uint16_t       timeout = 0 )
+                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! List entries of a directory - async
@@ -575,7 +605,8 @@ namespace XrdCl
       XRootDStatus DirList( const std::string   &path,
                             DirListFlags::Flags  flags,
                             ResponseHandler     *handler,
-                            uint16_t             timeout = 0 );
+                            uint16_t             timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! List entries of a directory - sync
@@ -590,7 +621,8 @@ namespace XrdCl
       XRootDStatus DirList( const std::string    &path,
                             DirListFlags::Flags   flags,
                             DirectoryList       *&response,
-                            uint16_t              timeout = 0 );
+                            uint16_t              timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Send info to the server (up to 1024 characters)- async
@@ -605,7 +637,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus SendInfo( const std::string &info,
                              ResponseHandler   *handler,
-                             uint16_t           timeout = 0 );
+                             uint16_t           timeout = 0 )
+                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Send info to the server (up to 1024 characters) - sync
@@ -618,7 +651,8 @@ namespace XrdCl
       //------------------------------------------------------------------------
       XRootDStatus SendInfo( const std::string  &info,
                              Buffer            *&response,
-                             uint16_t            timeout = 0 );
+                             uint16_t            timeout = 0 )
+                             XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Prepare one or more files for access - async
@@ -637,7 +671,8 @@ namespace XrdCl
                             PrepareFlags::Flags             flags,
                             uint8_t                         priority,
                             ResponseHandler                *handler,
-                            uint16_t                        timeout = 0 );
+                            uint16_t                        timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Prepare one or more files for access - sync
@@ -654,7 +689,8 @@ namespace XrdCl
                             PrepareFlags::Flags              flags,
                             uint8_t                          priority,
                             Buffer                         *&response,
-                            uint16_t                         timeout = 0 );
+                            uint16_t                         timeout = 0 )
+                            XRD_WARN_UNUSED_RESULT;
 
       //------------------------------------------------------------------------
       //! Set filesystem property
@@ -672,6 +708,8 @@ namespace XrdCl
       bool GetProperty( const std::string &name, std::string &value ) const;
 
     private:
+      FileSystem(const FileSystem &other);
+      FileSystem &operator = (const FileSystem &other);
 
       //------------------------------------------------------------------------
       // Send a message in a locked environment

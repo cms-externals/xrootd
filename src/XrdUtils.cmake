@@ -44,13 +44,17 @@ add_library(
                                 XrdSys/XrdSysHeaders.hh
   XrdSys/XrdSysError.cc         XrdSys/XrdSysError.hh
   XrdSys/XrdSysLogger.cc        XrdSys/XrdSysLogger.hh
+  XrdSys/XrdSysLogging.cc       XrdSys/XrdSysLogging.hh
+                                XrdSys/XrdSysLogPI.hh
                                 XrdSys/XrdSysLinuxSemaphore.hh
+  XrdSys/XrdSysXAttr.cc         XrdSys/XrdSysXAttr.hh
 
   #-----------------------------------------------------------------------------
   # XrdOuc
   #-----------------------------------------------------------------------------
   XrdOuc/XrdOuca2x.cc           XrdOuc/XrdOuca2x.hh
   XrdOuc/XrdOucArgs.cc          XrdOuc/XrdOucArgs.hh
+  XrdOuc/XrdOucBackTrace.cc     XrdOuc/XrdOucBackTrace.hh
   XrdOuc/XrdOucBuffer.cc        XrdOuc/XrdOucBuffer.hh
                                 XrdOuc/XrdOucCache.hh
   XrdOuc/XrdOucCacheData.cc     XrdOuc/XrdOucCacheData.hh
@@ -65,12 +69,18 @@ add_library(
   XrdOuc/XrdOucERoute.cc        XrdOuc/XrdOucERoute.hh
                                 XrdOuc/XrdOucErrInfo.hh
   XrdOuc/XrdOucExport.cc        XrdOuc/XrdOucExport.hh
+  XrdOuc/XrdOucFileInfo.cc      XrdOuc/XrdOucFileInfo.hh
+  XrdOuc/XrdOucGMap.cc          XrdOuc/XrdOucGMap.hh
   XrdOuc/XrdOucHashVal.cc
+  XrdOuc/XrdOucLogging.cc       XrdOuc/XrdOucLogging.hh
   XrdOuc/XrdOucMsubs.cc         XrdOuc/XrdOucMsubs.hh
   XrdOuc/XrdOucName2Name.cc     XrdOuc/XrdOucName2Name.hh
   XrdOuc/XrdOucN2NLoader.cc     XrdOuc/XrdOucN2NLoader.hh
   XrdOuc/XrdOucNList.cc         XrdOuc/XrdOucNList.hh
   XrdOuc/XrdOucNSWalk.cc        XrdOuc/XrdOucNSWalk.hh
+  XrdOuc/XrdOucPinLoader.cc     XrdOuc/XrdOucPinLoader.hh
+  XrdOuc/XrdOucPinPath.cc       XrdOuc/XrdOucPinPath.hh
+  XrdOuc/XrdOucPreload.cc       XrdOuc/XrdOucPreload.hh
   XrdOuc/XrdOucProg.cc          XrdOuc/XrdOucProg.hh
   XrdOuc/XrdOucPup.cc           XrdOuc/XrdOucPup.hh
   XrdOuc/XrdOucReqID.cc         XrdOuc/XrdOucReqID.hh
@@ -83,6 +93,7 @@ add_library(
   XrdOuc/XrdOucTPC.cc           XrdOuc/XrdOucTPC.hh
   XrdOuc/XrdOucTrace.cc         XrdOuc/XrdOucTrace.hh
   XrdOuc/XrdOucUtils.cc         XrdOuc/XrdOucUtils.hh
+  XrdOuc/XrdOucVerName.cc       XrdOuc/XrdOucVerName.hh
                                 XrdOuc/XrdOucChain.hh
                                 XrdOuc/XrdOucDLlist.hh
                                 XrdOuc/XrdOucIOVec.hh
@@ -131,6 +142,7 @@ add_library(
   # Xrd
   #-----------------------------------------------------------------------------
   Xrd/XrdBuffer.cc              Xrd/XrdBuffer.hh
+  Xrd/XrdBuffXL.cc              Xrd/XrdBuffXL.hh
   Xrd/XrdInet.cc                Xrd/XrdInet.hh
   Xrd/XrdInfo.cc                Xrd/XrdInfo.hh
   Xrd/XrdJob.hh
@@ -155,11 +167,20 @@ add_library(
   XrdCks/XrdCksConfig.cc           XrdCks/XrdCksConfig.hh
   XrdCks/XrdCksLoader.cc           XrdCks/XrdCksLoader.hh
   XrdCks/XrdCksManager.cc          XrdCks/XrdCksManager.hh
+  XrdCks/XrdCksManOss.cc           XrdCks/XrdCksManOss.hh
                                    XrdCks/XrdCksCalcadler32.hh
                                    XrdCks/XrdCksCalc.hh
                                    XrdCks/XrdCksData.hh
                                    XrdCks/XrdCks.hh
                                    XrdCks/XrdCksXAttr.hh
+
+  #-----------------------------------------------------------------------------
+  # XrdSec
+  #-----------------------------------------------------------------------------
+  XrdSec/XrdSecLoadSecurity.cc     XrdSec/XrdSecLoadSecurity.hh
+  XrdSecsss/XrdSecsssID.cc         XrdSecsss/XrdSecsssID.hh
+  XrdSecsss/XrdSecsssKT.cc         XrdSecsss/XrdSecsssKT.hh
+
 )
 
 target_link_libraries(
@@ -179,41 +200,8 @@ set_target_properties(
   LINK_INTERFACE_LIBRARIES "" )
 
 #-------------------------------------------------------------------------------
-# libz compatible CRC32
-#-------------------------------------------------------------------------------
-add_library(
-  XrdCksCalczcrc32
-  SHARED
-  XrdCks/XrdCksCalczcrc32.cc )
-
-target_link_libraries(
-  XrdCksCalczcrc32
-  XrdUtils
-  ${ZLIB_LIBRARY} )
-
-set_target_properties(
-  XrdCksCalczcrc32
-  PROPERTIES
-  VERSION   ${XRD_ZCRC32_VERSION}
-  SOVERSION ${XRD_ZCRC32_SOVERSION}
-  INTERFACE_LINK_LIBRARIES ""
-  LINK_INTERFACE_LIBRARIES "" )
-
-#-------------------------------------------------------------------------------
-# GPFS stat() plugin library
-#-------------------------------------------------------------------------------
-add_library(
-  XrdOssSIgpfsT
-  SHARED
-  XrdOss/XrdOssSIgpfsT.cc )
-
-target_link_libraries(
-  XrdOssSIgpfsT
-  XrdUtils )
-
-#-------------------------------------------------------------------------------
 # Install
 #-------------------------------------------------------------------------------
 install(
-  TARGETS XrdUtils XrdCksCalczcrc32
+  TARGETS XrdUtils
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} )

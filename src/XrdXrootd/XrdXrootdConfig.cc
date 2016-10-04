@@ -56,6 +56,7 @@
 #include "XrdOuc/XrdOucStream.hh"
 #include "XrdOuc/XrdOucTrace.hh"
 #include "XrdOuc/XrdOucUtils.hh"
+#include "XrdSec/XrdSecLoadSecurity.hh"
 #include "XrdSys/XrdSysError.hh"
 #include "XrdSys/XrdSysHeaders.hh"
 #include "XrdSys/XrdSysLogger.hh"
@@ -75,6 +76,7 @@
 #include "XrdXrootd/XrdXrootdXPath.hh"
 
 #include "Xrd/XrdBuffer.hh"
+#include "Xrd/XrdInet.hh"
 
 /******************************************************************************/
 /*         P r o t o c o l   C o m m a n d   L i n e   O p t i o n s          */
@@ -130,12 +132,10 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
                              const char       *configFn,
                              XrdOucEnv        *EnvInfo);
 
-   extern XrdSecService    *XrdXrootdloadSecurity(XrdSysError *, char *, 
-                                                  char *, void **);
-
    extern XrdSfsFileSystem *XrdXrootdloadFileSystem(XrdSysError *, 
                                                     XrdSfsFileSystem *,
-                                                    char *, const char *);
+                                                    char *, int,
+                                                    const char *, XrdOucEnv *);
    extern XrdSfsFileSystem *XrdDigGetFS
                             (XrdSfsFileSystem *nativeFS,
                              XrdSysLogger     *Logger,
@@ -145,7 +145,7 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
 
    XrdOucEnv myEnv;
    XrdXrootdXPath *xp;
-   void *secGetProt = 0;
+   XrdSecGetProt_t secGetProt = 0;
    char *adminp, *rdf, *bP, *tmp, c, buff[1024];
    int i, n, deper = 0;
 
@@ -212,7 +212,8 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
 // transfer size to the buffer size (before it was a reasonable 256K).
 //
    if (!(as_miniosz = as_segsize/2)) as_miniosz = as_segsize;
-   maxTransz = maxBuffsz = BPool->MaxSize();
+   n = (pi->theEnv ? pi->theEnv->GetInt("MaxBuffSize") : 0);
+   maxTransz = maxBuffsz = (n ? n : BPool->MaxSize());
    memset(Route, 0, sizeof(Route));
 
 // Now process and configuration parameters
@@ -221,13 +222,18 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
    if (rdf && Config(rdf)) return 0;
    if (pi->DebugON) XrdXrootdTrace->What = TRACE_ALL;
 
+// Check if we are exporting a generic object name
+//
+   if (XPList.Opts() & XROOTDXP_NOSLASH)
+      {eDest.Say("Config exporting ", XPList.Path(n)); n += 2;}
+      else n = 0;
+
 // Check if we are exporting anything
 //
-   if (!(xp = XPList.Next()))
+   if (!(xp = XPList.Next()) && !n)
       {XPList.Insert("/tmp"); n = 8;
        eDest.Say("Config warning: only '/tmp' will be exported.");
       } else {
-       n = 0;
        while(xp) {eDest.Say("Config exporting ", xp->Path(i));
                   n += i+2; xp = xp->Next();
                  }
@@ -236,6 +242,8 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
 // Export the exports
 //
    bP = tmp = (char *)malloc(n);
+   if (XPList.Opts() & XROOTDXP_NOSLASH)
+      {strcpy(bP, XPList.Path(i)); bP += i, *bP++ = ' ';}
    xp = XPList.Next();
    while(xp) {strcpy(bP, xp->Path(i)); bP += i; *bP++ = ' '; xp = xp->Next();}
    *(bP-1) = '\0';
@@ -246,24 +254,35 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
    if (!SecLib) eDest.Say("Config warning: 'xrootd.seclib' not specified;"
                           " strong authentication disabled!");
       else {TRACE(DEBUG, "Loading security library " <<SecLib);
-            if (!(CIA = XrdXrootdloadSecurity(&eDest, SecLib, pi->ConfigFN,
-                                              &secGetProt)))
+            if (!(CIA = XrdSecLoadSecService(&eDest, pi->ConfigFN,
+                        (strcmp(SecLib,"default") ? SecLib : 0), &secGetProt)))
                {eDest.Emsg("Config", "Unable to load security system.");
                 return 0;
                }
            }
 
+// Set up the network for self-identification and display it
+//
+   pi->NetTCP->netIF.Port(Port);
+   pi->NetTCP->netIF.Display("Config ");
+
 // Establish our specific environment that will be passed along
 //
    myEnv.PutPtr("XrdInet*", (void *)(pi->NetTCP));
-   myEnv.PutPtr("XrdSecGetProtocol*", secGetProt);
+   myEnv.PutPtr("XrdNetIF*", (void *)(&(pi->NetTCP->netIF)));
+   myEnv.PutPtr("XrdSecGetProtocol*", (void *)secGetProt);
    myEnv.PutPtr("XrdScheduler*", Sched);
+
+// Copy over the xrd environment which contains plugin argv's
+//
+   if (pi->theEnv) myEnv.PutPtr("xrdEnv*", pi->theEnv);
 
 // Get the filesystem to be used
 //
    if (FSLib[0])
       {TRACE(DEBUG, "Loading base filesystem library " <<FSLib[0]);
-       osFS = XrdXrootdloadFileSystem(&eDest, 0, FSLib[0], pi->ConfigFN);
+       osFS = XrdXrootdloadFileSystem(&eDest, 0, FSLib[0], FSLvn[0],
+                                      pi->ConfigFN, &myEnv);
       } else {
        osFS = XrdSfsGetDefaultFileSystem(0,eDest.logger(),pi->ConfigFN,&myEnv);
       }
@@ -279,7 +298,8 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
 //
    if (FSLib[1])
       {TRACE(DEBUG, "Loading wrapper filesystem library " <<FSLib[1]);
-       osFS = XrdXrootdloadFileSystem(&eDest, osFS, FSLib[1], pi->ConfigFN);
+       osFS = XrdXrootdloadFileSystem(&eDest, osFS, FSLib[1], FSLvn[1],
+                                      pi->ConfigFN, &myEnv);
        if (!osFS)
           {eDest.Emsg("Config", "Unable to load file system wrapper.");
            return 0;
@@ -300,10 +320,14 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
 //
    if (JobCKT && JobLCL)
       {XrdOucErrInfo myError("Config");
-       if (osFS->chksum(XrdSfsFileSystem::csSize,JobCKT,0,myError))
-          {eDest.Emsg("Config", JobCKT, " checksum is not natively supported.");
-           return 0;
-          }
+       XrdOucTList *tP = JobCKTLST;
+       do {if (osFS->chksum(XrdSfsFileSystem::csSize,tP->text,0,myError))
+              {eDest.Emsg("Config",tP->text,"checksum is not natively supported.");
+               return 0;
+              }
+           tP->ival[1] = myError.getErrInfo();
+           tP = tP->next;
+          } while(tP);
       }
 
 // Initialiaze for AIO
@@ -366,6 +390,8 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
        char buff[1024], puff[1024], xCgi[RD_Num] = {0};
        if (isRedir) {cgi1 = "+"; cgi2 = getenv("XRDCMSCLUSTERID");}
           else      {cgi1 = "";  cgi2 = pi->myName;}
+       myCNlen = snprintf(buff, sizeof(buff), "%s%s", cgi1, cgi2);
+       myCName = strdup(buff);
        do {k = xp->Opts();
            if (Route[k].Host[0] == Route[k].Host[1]
            &&  Route[k].Port[0] == Route[k].Port[1]) *puff = 0;
@@ -376,10 +402,13 @@ int XrdXrootdProtocol::Configure(char *parms, XrdProtocol_Config *pi)
               {bool isdup = Route[k].Host[0] == Route[k].Host[1]
                          && Route[k].Port[0] == Route[k].Port[1];
                for (i = 0; i < 2; i++)
-                   {snprintf(buff,sizeof(buff), "%s?tried=%s%s",
-                             Route[k].Host[i], cgi1, cgi2);
+                   {n = snprintf(buff,sizeof(buff), "%s?tried=%s%s",
+                                 Route[k].Host[i], cgi1, cgi2);
                     free(Route[k].Host[i]); Route[k].Host[i] = strdup(buff);
-                    if (isdup) {Route[k].Host[1] = Route[k].Host[0]; break;}
+                    Route[k].RDSz[i] = n;
+                    if (isdup) {Route[k].Host[1] = Route[k].Host[0];
+                                Route[k].RDSz[1] = n; break;
+                               }
                    }
               }
            xCgi[k] = 1;
@@ -622,10 +651,13 @@ int XrdXrootdProtocol::xasync(XrdOucStream &Config)
 
 /* Function: xcksum
 
-   Purpose:  To parse the directive: chksum [max <n>] <type> [<path>]
+   Purpose:  To parse the directive: chksum [chkcgi] [max <n>] <type> [<path>]
 
              max       maximum number of simultaneous jobs
-             <type>    algorithm of checksum (e.g., md5)
+             chkcgi    Always check for checksum type in cgo info.
+             <type>    algorithm of checksum (e.g., md5). If more than one
+                       checksum is supported then they should be listed with
+                       each separated by a space.
              <path>    the path of the program performing the checksum
                        If no path is given, the checksum is local.
 
@@ -636,13 +668,22 @@ int XrdXrootdProtocol::xcksum(XrdOucStream &Config)
 {
    static XrdOucProg *theProg = 0;
    int (*Proc)(XrdOucStream *, char **, int) = 0;
+   XrdOucTList *tP, *algFirst = 0, *algLast = 0;
    char *palg, prog[2048];
-   int jmax = 4;
+   int jmax = 4, anum[2] = {0,0};
 
 // Get the algorithm name and the program implementing it
 //
+   JobCKCGI = 0;
    while ((palg = Config.GetWord()) && *palg != '/')
-         {if (strcmp(palg, "max")) break;
+         {if (!strcmp(palg,"chkcgi")) {JobCKCGI = 1; continue;}
+          if (strcmp(palg, "max"))
+             {XrdOucTList *xalg = new XrdOucTList(palg, anum); anum[0]++;
+              if (algLast) algLast->next = xalg;
+                 else      algFirst      = xalg;
+              algLast = xalg;
+              continue;
+             }
           if (!(palg = Config.GetWord()))
              {eDest.Emsg("Config", "chksum max not specified"); return 1;}
           if (XrdOuca2x::a2i(eDest, "chksum max", palg, &jmax, 0)) return 1;
@@ -650,16 +691,31 @@ int XrdXrootdProtocol::xcksum(XrdOucStream &Config)
 
 // Verify we have an algoritm
 //
-   if (!palg || *palg == '/')
+   if (!algFirst)
       {eDest.Emsg("Config", "chksum algorithm not specified"); return 1;}
    if (JobCKT) free(JobCKT);
-   JobCKT = strdup(palg);
+   JobCKT = strdup(algFirst->text);
+
+// Handle alternate checksums
+//
+   while((tP = JobCKTLST)) {JobCKTLST = tP->next; delete tP;}
+   JobCKTLST = algFirst;
+   if (algFirst->next) JobCKCGI = 2;
+
+// Handle program if we have one
+//
+   if (palg)
+      {int n = strlen(palg);
+       if (n+2 >= (int)sizeof(prog))
+          {eDest.Emsg("Config", "cksum program too long"); return 1;}
+       strcpy(prog, palg); palg = prog+n; *palg++ = ' '; n = sizeof(prog)-n-1;
+       if (!Config.GetRest(palg, n))
+          {eDest.Emsg("Config", "cksum parameters too long"); return 1;}
+      } else *prog = 0;
 
 // Check if we have a program. If not, then this will be a local checksum and
 // the algorithm will be verified after we load the filesystem.
 //
-   if (!Config.GetRest(prog, sizeof(prog)))
-      {eDest.Emsg("Config", "cksum parameters too long"); return 1;}
    if (*prog) JobLCL = 0;
       else {  JobLCL = 1; Proc = &CheckSum; strcpy(prog, "chksum");}
 
@@ -719,7 +775,7 @@ int XrdXrootdProtocol::xdig(XrdOucStream &Config)
 
 /* Function: xexp
 
-   Purpose:  To parse the directive: export <path> [lock|nolock]
+   Purpose:  To parse the directive: export <path> [lock|nolock] [mwfiles]
 
              <path>    the path to be exported.
 
@@ -740,9 +796,11 @@ int XrdXrootdProtocol::xexp(XrdOucStream &Config)
 
 // Get export lock option
 //
-   if ((val = Config.GetWord()))
-      {if (!strcmp("nolock", val)) popt = XROOTDXP_NOLK;
-          else if (strcmp("lock", val)) Config.RetToken();
+   while((val = Config.GetWord()))
+      {     if (!strcmp( "nolock", val)) popt |=  XROOTDXP_NOLK;
+       else if (!strcmp(   "lock", val)) popt &= ~XROOTDXP_NOLK;
+       else if (!strcmp("mwfiles", val)) popt |=  XROOTDXP_NOMWCHK;
+       else {Config.RetToken(); break;}
       }
 
 // Add path to configuration
@@ -754,7 +812,20 @@ int XrdXrootdProtocol::xexp(XrdOucStream &Config)
 
 int XrdXrootdProtocol::xexpdo(char *path, int popt)
 {
-   const char *opaque;
+   char *opaque;
+   int   xopt;
+
+// Check if we are exporting a generic name
+//
+   if (*path == '*')
+      {popt |= XROOTDXP_NOSLASH | XROOTDXP_NOCGI;
+       if (*(path+1))
+          {if (*(path+1) == '?') popt &= ~XROOTDXP_NOCGI;
+              else {eDest.Emsg("Config","invalid export path -",path);return 1;}
+          }
+       XPList.Set(popt, path);
+       return 0;
+      }
 
 // Make sure path start with a slash
 //
@@ -763,7 +834,8 @@ int XrdXrootdProtocol::xexpdo(char *path, int popt)
 
 // Record the path
 //
-   if (!Squash(path)) XPList.Insert(path, popt);
+   if (!(xopt = Squash(path)) || xopt != (popt|XROOTDXP_OK))
+      XPList.Insert(path, popt);
    return 0;
 }
   
@@ -773,10 +845,10 @@ int XrdXrootdProtocol::xexpdo(char *path, int popt)
 
 /* Function: xfsl
 
-   Purpose:  To parse the directive: fslib [?] [throttle | <fspath2>]
-                                               {default  | <fspath1>}
+   Purpose:  To parse the directive: fslib [throttle | [-2] <fspath2>]
+                                           {default  | [-2] <fspath1>}
 
-             ?         check if fslib build version matches our version
+             -2        Uses version2 of the plugin initializer.
                        This is ignored now because it's always done.
              throttle  load libXrdThrottle.so as the head interface.
              <fspath2> load the named library as the head interface.
@@ -795,6 +867,7 @@ int XrdXrootdProtocol::xfsl(XrdOucStream &Config)
 //
    if (FSLib[0]) {free(FSLib[0]); FSLib[0] = 0;}
    if (FSLib[1]) {free(FSLib[1]); FSLib[1] = 0;}
+   FSLvn[0] = FSLvn[1] = 0;
 
 // Get the path
 //
@@ -809,31 +882,46 @@ int XrdXrootdProtocol::xfsl(XrdOucStream &Config)
           {eDest.Emsg("Config","fslib throttle target library not specified");
            return 1;
           }
-       if (!strcmp("default", val)) return 0;
-       FSLib[0] = xfsL(val);
+       return xfsL(Config, val, 0);
+      }
+
+// Check for default or default library, the common case
+//
+   if (xfsL(Config, val, 1))    return 1;
+   if (!FSLib[1])               return 0;
+
+// If we dont have another token, then demote the previous library
+//
+   if (!(val = Config.GetWord()))
+      {FSLib[0] = FSLib[1]; FSLib[1] = 0;
+       FSLvn[0] = FSLvn[1]; FSLvn[1] = 0;
        return 0;
       }
 
 // Check for default or default library, the common case
 //
-   if (!strcmp("default", val) || !(FSLib[1] = xfsL(val))) return 0;
-
-// If we dont have another token, then demote the previous library
-//
-   if (!(val = Config.GetWord()))
-      {FSLib[0] = FSLib[1]; FSLib[1] = 0; return 0;}
-
-// Check for default or default library, the common case
-//
-   if (strcmp("default", val)) FSLib[0] = xfsL(val);
-   return 0;
+   return xfsL(Config, val, 0);
 }
 
 /******************************************************************************/
 
-char *XrdXrootdProtocol::xfsL(char *val)
+int XrdXrootdProtocol::xfsL(XrdOucStream &Config, char *val, int lix)
 {
     char *Slash;
+    int lvn = 0;
+
+// Check if this is a version token
+//
+   if (!strcmp(val, "-2"))
+      {lvn = 2;
+       if (!(val = Config.GetWord()))
+          {eDest.Emsg("Config", "fslib not specified"); return 1;}
+      }
+
+// We will play fast and furious with the syntax as "default" should not be
+// prefixed with a version number but will let that pass.
+//
+   if (!strcmp("default", val)) return 0;
 
 // If this is the "standard" name tell the user that we are ignoring this lib.
 // Otherwise, record the path and return.
@@ -842,7 +930,7 @@ char *XrdXrootdProtocol::xfsL(char *val)
       else Slash++;
    if (!strcmp(Slash, "libXrdOfs.so"))
       eDest.Say("Config warning: ignoring fslib; libXrdOfs.so is built-in.");
-      else return strdup(val);
+      else {FSLib[lix] = strdup(val); FSLvn[lix] = lvn;}
    return 0;
 }
 
@@ -1348,9 +1436,10 @@ bool XrdXrootdProtocol::xred_xok(int func, char *rHost[2], int rPort[2])
 
 /* Function: xsecl
 
-   Purpose:  To parse the directive: seclib <path>
+   Purpose:  To parse the directive: seclib {default | <path>}
 
              <path>    the path of the security library to be used.
+                       "default" uses the default security library.
 
   Output: 0 upon success or !0 upon failure.
 */

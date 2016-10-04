@@ -27,9 +27,11 @@
 #include "XrdCl/XrdClCheckSumManager.hh"
 #include "XrdCl/XrdClTransportManager.hh"
 #include "XrdCl/XrdClPlugInManager.hh"
-#include "XrdSys/XrdSysPlugin.hh"
+#include "XrdOuc/XrdOucPreload.hh"
+#include "XrdSys/XrdSysAtomics.hh"
 #include "XrdSys/XrdSysUtils.hh"
 #include "XrdSys/XrdSysPwd.hh"
+#include "XrdVersion.hh"
 
 #include <libgen.h>
 #include <cstring>
@@ -43,6 +45,88 @@
 #include <unistd.h>
 
 XrdVERSIONINFO( XrdCl, client );
+
+//------------------------------------------------------------------------------
+// Forking functions
+//------------------------------------------------------------------------------
+extern "C"
+{
+  //----------------------------------------------------------------------------
+  // Prepare for the forking
+  //----------------------------------------------------------------------------
+  static void prepare()
+  {
+    using namespace XrdCl;
+    Log         *log         = DefaultEnv::GetLog();
+    Env         *env         = DefaultEnv::GetEnv();
+    ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
+
+    log->Debug( UtilityMsg, "In the prepare fork handler for process %d",
+                getpid() );
+
+    //--------------------------------------------------------------------------
+    // Run the fork handler if it's enabled
+    //--------------------------------------------------------------------------
+    int runForkHandler = DefaultRunForkHandler;
+    env->GetInt( "RunForkHandler", runForkHandler );
+    if( runForkHandler )
+      forkHandler->Prepare();
+    env->WriteLock();
+  }
+
+  //----------------------------------------------------------------------------
+  // Parent handler
+  //----------------------------------------------------------------------------
+  static void parent()
+  {
+    using namespace XrdCl;
+    Log         *log         = DefaultEnv::GetLog();
+    Env         *env         = DefaultEnv::GetEnv();
+    ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
+    env->UnLock();
+
+    pid_t pid = getpid();
+    log->Debug( UtilityMsg, "In the parent fork handler for process %d", pid );
+
+    //--------------------------------------------------------------------------
+    // Run the fork handler if it's enabled
+    //--------------------------------------------------------------------------
+    int runForkHandler = DefaultRunForkHandler;
+    env->GetInt( "RunForkHandler", runForkHandler );
+    if( runForkHandler )
+    {
+      log->SetPid(pid);
+      forkHandler->Parent();
+    }
+  }
+
+  //----------------------------------------------------------------------------
+  // Child handler
+  //----------------------------------------------------------------------------
+  static void child()
+  {
+    using namespace XrdCl;
+    DefaultEnv::ReInitializeLogging();
+    Log         *log         = DefaultEnv::GetLog();
+    Env         *env         = DefaultEnv::GetEnv();
+    ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
+    env->ReInitializeLock();
+
+    pid_t pid = getpid();
+    log->Debug( UtilityMsg, "In the child fork handler for process %d", pid );
+
+    //--------------------------------------------------------------------------
+    // Run the fork handler if it's enabled
+    //--------------------------------------------------------------------------
+    int runForkHandler = DefaultRunForkHandler;
+    env->GetInt( "RunForkHandler", runForkHandler );
+    if( runForkHandler )
+    {
+      log->SetPid(pid);
+      forkHandler->Child();
+    }
+  }
+}
 
 namespace
 {
@@ -159,7 +243,7 @@ namespace XrdCl
   ForkHandler       *DefaultEnv::sForkHandler        = 0;
   FileTimer         *DefaultEnv::sFileTimer          = 0;
   Monitor           *DefaultEnv::sMonitor            = 0;
-  XrdSysPlugin      *DefaultEnv::sMonitorLibHandle   = 0;
+  XrdOucPinLoader   *DefaultEnv::sMonitorLibHandle   = 0;
   bool               DefaultEnv::sMonitorInitialized = false;
   CheckSumManager   *DefaultEnv::sCheckSumManager    = 0;
   TransportManager  *DefaultEnv::sTransportManager   = 0;
@@ -193,6 +277,14 @@ namespace XrdCl
     REGISTER_VAR_INT( varsInt, "LoadBalancerTTL",      DefaultLoadBalancerTTL      );
     REGISTER_VAR_INT( varsInt, "CPInitTimeout",        DefaultCPInitTimeout        );
     REGISTER_VAR_INT( varsInt, "CPTPCTimeout",         DefaultCPTPCTimeout         );
+    REGISTER_VAR_INT( varsInt, "TCPKeepAlive",         DefaultTCPKeepAlive         );
+    REGISTER_VAR_INT( varsInt, "TCPKeepAliveTime",     DefaultTCPKeepAliveTime     );
+    REGISTER_VAR_INT( varsInt, "TCPKeepAliveInterval", DefaultTCPKeepAliveInterval );
+    REGISTER_VAR_INT( varsInt, "TCPKeepProbes",        DefaultTCPKeepAliveProbes   );
+    REGISTER_VAR_INT( varsInt, "MultiProtocol",        DefaultMultiProtocol        );
+    REGISTER_VAR_INT( varsInt, "ParallelEvtLoop",      DefaultParallelEvtLoop      );
+    REGISTER_VAR_INT( varsInt, "MetalinkProcessing",   DefaultMetalinkProcessing   );
+    REGISTER_VAR_INT( varsInt, "LocalMetalinkFile",    DefaultLocalMetalinkFile    );
 
     REGISTER_VAR_STR( varsStr, "PollerPreference",     DefaultPollerPreference     );
     REGISTER_VAR_STR( varsStr, "ClientMonitor",        DefaultClientMonitor        );
@@ -200,6 +292,9 @@ namespace XrdCl
     REGISTER_VAR_STR( varsStr, "NetworkStack",         DefaultNetworkStack         );
     REGISTER_VAR_STR( varsStr, "PlugIn",               DefaultPlugIn               );
     REGISTER_VAR_STR( varsStr, "PlugInConfDir",        DefaultPlugInConfDir        );
+    REGISTER_VAR_STR( varsStr, "ReadRecovery",         DefaultReadRecovery         );
+    REGISTER_VAR_STR( varsStr, "WriteRecovery",        DefaultWriteRecovery        );
+    REGISTER_VAR_STR( varsStr, "GlfnRedirector",       DefaultGlfnRedirector       );
 
     //--------------------------------------------------------------------------
     // Process the configuration files
@@ -240,13 +335,15 @@ namespace XrdCl
                   it->first.c_str(), it->second.c_str() );
 
     //--------------------------------------------------------------------------
-    // Apply the settings
+    // Monitoring settings
     //--------------------------------------------------------------------------
     char *tmp = strdup( XrdSysUtils::ExecName() );
     char *appName = basename( tmp );
     PutString( "AppName", appName );
     free( tmp );
     ImportString( "AppName", "XRD_APPNAME" );
+    PutString( "MonInfo", "" );
+    ImportString( "MonInfo", "XRD_MONINFO" );
 
     //--------------------------------------------------------------------------
     // Process ints
@@ -288,6 +385,11 @@ namespace XrdCl
       std::transform( name.begin(), name.end(), name.begin(), ::toupper );
       ImportString( varsStr[i].name, name );
     }
+
+    //--------------------------------------------------------------------------
+    // Register fork handlers
+    //--------------------------------------------------------------------------
+    pthread_atfork( prepare, parent, child );
   }
 
   //----------------------------------------------------------------------------
@@ -303,31 +405,39 @@ namespace XrdCl
   //----------------------------------------------------------------------------
   PostMaster *DefaultEnv::GetPostMaster()
   {
-    if( unlikely(!sPostMaster) )
+    PostMaster* postMaster = AtomicGet(sPostMaster);
+
+    if( unlikely( !postMaster ) )
     {
       XrdSysMutexHelper scopedLock( sInitMutex );
-      if( sPostMaster )
-        return sPostMaster;
-      sPostMaster = new PostMaster();
+      postMaster = AtomicGet(sPostMaster);
 
-      if( !sPostMaster->Initialize() )
+      if( postMaster )
+        return postMaster;
+
+      postMaster = new PostMaster();
+
+      if( !postMaster->Initialize() )
       {
-        delete sPostMaster;
-        sPostMaster = 0;
+        delete postMaster;
+        postMaster = 0;
         return 0;
       }
 
-      if( !sPostMaster->Start() )
+      if( !postMaster->Start() )
       {
-        sPostMaster->Finalize();
-        delete sPostMaster;
-        sPostMaster = 0;
+        postMaster->Finalize();
+        delete postMaster;
+        postMaster = 0;
         return 0;
       }
-      sForkHandler->RegisterPostMaster( sPostMaster );
-      sPostMaster->GetTaskManager()->RegisterTask( sFileTimer, time(0), false );
+
+      sForkHandler->RegisterPostMaster( postMaster );
+      postMaster->GetTaskManager()->RegisterTask( sFileTimer, time(0), false );
+      AtomicCAS(sPostMaster, sPostMaster, postMaster);
     }
-    return sPostMaster;
+
+    return postMaster;
   }
 
   //----------------------------------------------------------------------------
@@ -439,19 +549,19 @@ namespace XrdCl
         // Loading the plugin
         //----------------------------------------------------------------------
         char *errBuffer = new char[4000];
-        sMonitorLibHandle = new XrdSysPlugin(
-                                 errBuffer, 4000, monitorLib.c_str(),
-                                 monitorLib.c_str(),
-                                 &XrdVERSIONINFOVAR( XrdCl ) );
+        sMonitorLibHandle = new XrdOucPinLoader(
+                                 errBuffer, 4000, &XrdVERSIONINFOVAR( XrdCl ),
+                                 "monitor", monitorLib.c_str() );
 
         typedef XrdCl::Monitor *(*MonLoader)(const char *, const char *);
         MonLoader loader;
-        loader = (MonLoader)sMonitorLibHandle->getPlugin( "XrdClGetMonitor" );
+        loader = (MonLoader)sMonitorLibHandle->Resolve( "XrdClGetMonitor", -1 );
         if( !loader )
         {
           log->Error( UtilityMsg, "Unable to initialize user monitoring: %s",
                       errBuffer );
           delete [] errBuffer;
+          sMonitorLibHandle->Unload();
           delete sMonitorLibHandle; sMonitorLibHandle = 0;
           return 0;
         }
@@ -467,6 +577,7 @@ namespace XrdCl
           log->Error( UtilityMsg, "Unable to initialize user monitoring: %s",
                       errBuffer );
           delete [] errBuffer;
+          sMonitorLibHandle->Unload();
           delete sMonitorLibHandle; sMonitorLibHandle = 0;
           return 0;
         }
@@ -538,7 +649,6 @@ namespace XrdCl
     sPlugInManager->ProcessEnvironmentSettings();
     sForkHandler->RegisterFileTimer( sFileTimer );
 
-
     //--------------------------------------------------------------------------
     // MacOSX library loading is completely moronic. We cannot dlopen a library
     // from a thread other than a main thread, so we-pre dlopen all the
@@ -549,21 +659,21 @@ namespace XrdCl
 
     const char *libs[] =
     {
-      "libXrdSeckrb5.dylib",
-      "libXrdSecgsi.dylib",
-      "libXrdSecgsiAuthzVO.dylib",
-      "libXrdSecgsiGMAPDN.dylib",
-      "libXrdSecgsiGMAPLDAP.dylib",
-      "libXrdSecpwd.dylib",
-      "libXrdSecsss.dylib",
-      "libXrdSecunix.dylib",
+      "libXrdSeckrb5.so",
+      "libXrdSecgsi.so",
+      "libXrdSecgsiAuthzVO.so",
+      "libXrdSecgsiGMAPDN.so",
+      "libXrdSecgsiGMAPLDAP.so",
+      "libXrdSecpwd.so",
+      "libXrdSecsss.so",
+      "libXrdSecunix.so",
       0
     };
 
     for( int i = 0; libs[i]; ++i )
     {
       sLog->Debug( UtilityMsg, "Attempting to pre-load: %s", libs[i] );
-      bool ok = XrdSysPlugin::Preload( libs[i], errBuff, 1024 );
+      bool ok = XrdOucPreload( libs[i], errBuff, 1024 );
       if( !ok )
         sLog->Error( UtilityMsg, "Unable to pre-load %s: %s", libs[i], errBuff );
     }
@@ -592,6 +702,9 @@ namespace XrdCl
 
     delete sMonitor;
     sMonitor = 0;
+
+    if( sMonitorLibHandle )
+      sMonitorLibHandle->Unload();
 
     delete sMonitorLibHandle;
     sMonitorLibHandle = 0;
@@ -702,114 +815,29 @@ namespace XrdCl
   }
 }
 
-//------------------------------------------------------------------------------
-// Forking functions
-//------------------------------------------------------------------------------
-extern "C"
-{
-  //----------------------------------------------------------------------------
-  // Prepare for the forking
-  //----------------------------------------------------------------------------
-  static void prepare()
-  {
-    //--------------------------------------------------------------------------
-    // Prepare
-    //--------------------------------------------------------------------------
-    using namespace XrdCl;
-    Log         *log         = DefaultEnv::GetLog();
-    Env         *env         = DefaultEnv::GetEnv();
-    ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
-
-    log->Debug( UtilityMsg, "In the prepare fork handler for process %d",
-                getpid() );
-
-    //--------------------------------------------------------------------------
-    // Run the fork handler if it's enabled
-    //--------------------------------------------------------------------------
-    int runForkHandler = DefaultRunForkHandler;
-    env->GetInt( "RunForkHandler", runForkHandler );
-    if( runForkHandler )
-      forkHandler->Prepare();
-    env->WriteLock();
-  }
-
-  //----------------------------------------------------------------------------
-  // Parent handler
-  //----------------------------------------------------------------------------
-  static void parent()
-  {
-    //--------------------------------------------------------------------------
-    // Prepare
-    //--------------------------------------------------------------------------
-    using namespace XrdCl;
-    Log         *log         = DefaultEnv::GetLog();
-    Env         *env         = DefaultEnv::GetEnv();
-    ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
-    env->UnLock();
-
-    log->Debug( UtilityMsg, "In the parent fork handler for process %d",
-                getpid() );
-
-    //--------------------------------------------------------------------------
-    // Run the fork handler if it's enabled
-    //--------------------------------------------------------------------------
-    int runForkHandler = DefaultRunForkHandler;
-    env->GetInt( "RunForkHandler", runForkHandler );
-    if( runForkHandler )
-      forkHandler->Parent();
-  }
-
-  //----------------------------------------------------------------------------
-  // Child handler
-  //----------------------------------------------------------------------------
-  static void child()
-  {
-    //--------------------------------------------------------------------------
-    // Prepare
-    //--------------------------------------------------------------------------
-    using namespace XrdCl;
-    DefaultEnv::ReInitializeLogging();
-    Log         *log         = DefaultEnv::GetLog();
-    Env         *env         = DefaultEnv::GetEnv();
-    ForkHandler *forkHandler = DefaultEnv::GetForkHandler();
-    env->ReInitializeLock();
-
-    log->Debug( UtilityMsg, "In the child fork handler for process %d",
-                getpid() );
-
-    //--------------------------------------------------------------------------
-    // Run the fork handler if it's enabled
-    //--------------------------------------------------------------------------
-    int runForkHandler = DefaultRunForkHandler;
-    env->GetInt( "RunForkHandler", runForkHandler );
-    if( runForkHandler )
-      forkHandler->Child();
-  }
-}
 
 //------------------------------------------------------------------------------
 // Static initialization and finalization
 //------------------------------------------------------------------------------
-namespace
+int EnvInitializer::counter = 0;
+
+//------------------------------------------------------------------------------
+// The constructor will be invoked in every translation unit
+// that includes XrdClDefaultEnv.hh, but the DefaultEnv will
+// be initialized only in the first one
+//------------------------------------------------------------------------------
+EnvInitializer::EnvInitializer ()
 {
-
-  static struct EnvInitializer
-  {
-    //--------------------------------------------------------------------------
-    // Initializer
-    //--------------------------------------------------------------------------
-    EnvInitializer()
-    {
-      XrdCl::DefaultEnv::Initialize();
-      pthread_atfork( prepare, parent, child );
-    }
-
-    //--------------------------------------------------------------------------
-    // Finalizer
-    //--------------------------------------------------------------------------
-    ~EnvInitializer()
-    {
-      XrdCl::DefaultEnv::Finalize();
-    }
-  } finalizer;
+  if( counter++ == 0 ) XrdCl::DefaultEnv::Initialize();
 }
+
+//------------------------------------------------------------------------------
+// The destructor will be invoked in every translation unit
+// that includes XrdClDefaultEnv.hh, but the DefaultEnv will
+// be finalized only once in the last one
+//------------------------------------------------------------------------------
+EnvInitializer::~EnvInitializer ()
+{
+  if( --counter == 0 ) XrdCl::DefaultEnv::Finalize();
+}
+
